@@ -135,6 +135,19 @@ pub extern "C" fn doh_proxy_start_with_config_json(config_json: *const c_char) -
     start_server_with_config(config)
 }
 
+/// 更新 FFI 独立查询的公共 ECH 策略，并清理旧策略的共享解析器。
+#[no_mangle]
+pub extern "C" fn doh_proxy_set_ech_dns_policy_json(policy_json: *const c_char) -> c_int {
+    let Ok(value) = parse_required_string(policy_json, "ech_dns_policy") else {
+        return -1;
+    };
+    let Ok(policy) = serde_json::from_str(&value) else {
+        return -1;
+    };
+    get_runtime().block_on(crate::dns::DnsResolver::set_shared_ech_dns_policy(policy));
+    0
+}
+
 /// Start the DOH proxy server (legacy API, uses Cloudflare DOH)
 /// Returns the port number on success, or -1 on failure
 #[no_mangle]
@@ -155,7 +168,10 @@ fn start_server_with_config(config: ProxyConfig) -> c_int {
     let rt = get_runtime();
 
     // Create the server
-    let server = match rt.block_on(async { DohProxyServer::new(config).await }) {
+    let server = match rt.block_on(async {
+        crate::dns::DnsResolver::set_shared_ech_dns_policy(config.ech_dns_policy.clone()).await;
+        DohProxyServer::new(config).await
+    }) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             tracing::error!("Failed to create DOH proxy server: {}", e);

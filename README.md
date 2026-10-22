@@ -8,6 +8,7 @@
 - **ECH 支持**：加密 TLS 握手中的 SNI 字段（需要服务器支持）
 - **多 DOH 服务器**：支持 Cloudflare、Canadian Shield、Google、Quad9、DNSPod、腾讯 DNS、阿里 DNS
 - **跨平台**：支持 Windows、macOS、Linux、Android、iOS
+- **公共 ECH 入口策略**：默认将 `linux.do`、`ldstatic.com` 及子域名的 DNS 查询替换为 `cloudflare-ech.com`，支持关闭及自定义域名；真实 Host、TLS SNI、证书校验和缓存键不变。
 
 ## 项目结构
 
@@ -127,6 +128,7 @@ cargo build --release --target aarch64-apple-ios
 | `<port>` | 监听端口（0 = 自动分配） |
 | `--doh <url>` | DOH 服务器 URL |
 | `--ipv6` | 优先使用 IPv6 地址 |
+| `--ech-dns-policy <json>` | 公共入口策略，如 `{"enabled":true,"custom_domains":["example.com"]}` |
 
 ### 支持的 DOH 服务器
 
@@ -139,6 +141,16 @@ cargo build --release --target aarch64-apple-ios
 | DNSPod | `https://doh.pub/dns-query` |
 | 腾讯 DNS | `https://dns.pub/dns-query` |
 | 阿里 DNS | `https://dns.alidns.com/dns-query` |
+
+### 公共 ECH 入口配置
+
+应用在 ECH 设置中管理此策略，关闭公共入口不等于关闭站点自身 ECH。自定义项仅接受完整域名，不接受 URL、端口、IP 或通配符，每项同时匹配其子域名。
+
+Android/iOS 与桌面 FFI 的启动 JSON 使用 `ech_dns_policy` 字段；桌面独立进程使用 `--ech-dns-policy` 传递相同 JSON。独立 FFI 查询通过 `doh_proxy_set_ech_dns_policy_json` 更新策略，返回 `0` 表示成功，`-1` 表示参数错误。策略变更隔离解析器及缓存，并由应用重启网关，已有连接保留启动时策略快照。
+
+本地 Selector 优选、加速路由表和节点列表仍按既有优先级工作；公共入口替换只发生在实际 DNS 查询层，不覆盖这些本地网络扩展。
+
+修改该策略接口后需重新构建目标平台原生库和桌面可执行文件，不能混用旧二进制。公网 ECH 冒烟测试位于 `tests/cloudflare_ech.rs`，默认忽略，需要显式运行。
 
 ## 测试
 

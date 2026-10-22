@@ -44,7 +44,8 @@ pub struct DohProxyServer {
 
 impl DohProxyServer {
     /// Create a new proxy server
-    pub async fn new(config: ProxyConfig) -> Result<Self> {
+    pub async fn new(mut config: ProxyConfig) -> Result<Self> {
+        config.ech_dns_policy = config.ech_dns_policy.normalized();
         if config.gateway_mode && config.enable_doh {
             info!(
                 "Creating local proxy in gateway (reverse proxy) mode with DoH server: {}",
@@ -95,11 +96,12 @@ impl DohProxyServer {
                 }
             }
             Some(
-                DnsResolver::shared(
+                DnsResolver::shared_with_policy(
                     &config.doh_server,
                     config.doh_server_ech.as_deref(),
                     config.prefer_ipv6,
                     config.upstream_proxy.clone(),
+                    config.ech_dns_policy.clone(),
                 )
                 .await?,
             )
@@ -145,10 +147,11 @@ impl DohProxyServer {
         };
         let (shutdown_tx, _) = broadcast::channel(1);
         let doh_config_key = config.enable_doh.then(|| {
-            DnsResolver::doh_config_key(
+            DnsResolver::doh_config_key_with_policy(
                 &config.doh_server,
                 config.doh_server_ech.as_deref(),
                 config.prefer_ipv6,
+                &config.ech_dns_policy,
             )
         });
 

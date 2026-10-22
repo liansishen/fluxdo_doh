@@ -12,6 +12,7 @@ pub mod cert;
 pub mod cfnet;
 pub mod dns;
 pub mod ech;
+pub mod ech_dns_policy;
 pub mod edge_pin;
 pub mod error;
 pub mod ffi;
@@ -154,6 +155,9 @@ pub struct ProxyConfig {
     /// When None, uses the same server as doh_server
     #[serde(default)]
     pub doh_server_ech: Option<String>,
+    /// 公共 ECH 入口开关与自定义域名。
+    #[serde(default)]
+    pub ech_dns_policy: ech_dns_policy::EchDnsPolicy,
     /// doh_server 的备用节点 IP：系统 DNS 解析不出或连不上 DoH 域名时直连这些 IP（SNI 不变）
     #[serde(default)]
     pub doh_bootstrap_ips: Vec<String>,
@@ -250,6 +254,7 @@ impl Default for ProxyConfig {
             enable_doh: true,
             doh_server: "https://cloudflare-dns.com/dns-query".to_string(),
             doh_server_ech: None,
+            ech_dns_policy: Default::default(),
             doh_bootstrap_ips: Vec::new(),
             doh_ech_bootstrap_ips: Vec::new(),
             doh_auth_token: None,

@@ -1,6 +1,7 @@
 //! DNS resolver with DOH and HTTPS record support for ECH config retrieval
 
 use crate::edge_pin::EdgePin;
+use crate::ech_dns_policy::EchDnsPolicy;
 use crate::error::{DohProxyError, Result};
 use crate::select::{Selector, SELECT_LOOKUP_WAIT_SECS};
 use crate::UpstreamProxyConfig;
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::lookup_host;
@@ -78,9 +79,15 @@ const NODE_LIST_PUBKEYS: &[(&str, [u8; 32])] = &[
         ],
     ),
 ];
+#[cfg(test)]
+#[path = "ech_query_tests.rs"]
+mod ech_query_tests;
+
 
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
+
+static SHARED_ECH_DNS_POLICY: LazyLock<RwLock<EchDnsPolicy>> = LazyLock::new(Default::default);
 
 /// DoH 服务器域名 -> 备用节点 IP，由启动配置登记
 static DOH_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
@@ -523,6 +530,7 @@ impl DohUpstream {
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
     resolver: TokioAsyncResolver,
+    ech_dns_policy: EchDnsPolicy,
     // IP 解析用（A/AAAA 查询）
     doh_ip: Option<DohUpstream>,
     force_doh_get_ip: bool,
@@ -1118,6 +1126,19 @@ impl RouteTableStore {
 }
 
 impl DnsResolver {
+    /// 只影响后续查询；运行中连接保留自己的策略快照。
+    pub async fn set_shared_ech_dns_policy(policy: EchDnsPolicy) {
+        let policy = policy.normalized();
+        {
+            let mut current = SHARED_ECH_DNS_POLICY.write();
+            if *current == policy {
+                return;
+            }
+            *current = policy;
+        }
+        Self::shared_resolver_holder().write().await.clear();
+    }
+
     fn shared_cache_key(
         doh_url: &str,
         doh_url_ech: Option<&str>,
@@ -1144,11 +1165,29 @@ impl DnsResolver {
         doh_url_ech: Option<&str>,
         prefer_ipv6: bool,
     ) -> String {
-        Self::shared_cache_key(
+        Self::doh_config_key_with_policy(
             doh_url,
-            doh_url_ech.filter(|value| *value != doh_url),
+            doh_url_ech,
             prefer_ipv6,
-            None,
+            &SHARED_ECH_DNS_POLICY.read(),
+        )
+    }
+
+    pub(crate) fn doh_config_key_with_policy(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        policy: &EchDnsPolicy,
+    ) -> String {
+        format!(
+            "{}|{}",
+            Self::shared_cache_key(
+                doh_url,
+                doh_url_ech.filter(|value| *value != doh_url),
+                prefer_ipv6,
+                None,
+            ),
+            serde_json::to_string(policy).unwrap(),
         )
     }
 
@@ -1547,12 +1586,28 @@ impl DnsResolver {
         prefer_ipv6: bool,
         upstream_proxy: Option<UpstreamProxyConfig>,
     ) -> Result<Arc<Self>> {
+        let policy = SHARED_ECH_DNS_POLICY.read().clone();
+        Self::shared_with_policy(doh_url, doh_url_ech, prefer_ipv6, upstream_proxy, policy).await
+    }
+
+    pub async fn shared_with_policy(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+        ech_dns_policy: EchDnsPolicy,
+    ) -> Result<Arc<Self>> {
+        let ech_dns_policy = ech_dns_policy.normalized();
         let normalized_doh_url_ech = doh_url_ech.filter(|value| *value != doh_url);
-        let cache_key = Self::shared_cache_key(
-            doh_url,
-            normalized_doh_url_ech,
-            prefer_ipv6,
-            upstream_proxy.as_ref(),
+        let cache_key = format!(
+            "{}|{}",
+            Self::shared_cache_key(
+                doh_url,
+                normalized_doh_url_ech,
+                prefer_ipv6,
+                upstream_proxy.as_ref(),
+            ),
+            serde_json::to_string(&ech_dns_policy).unwrap(),
         );
 
         {
@@ -1562,15 +1617,15 @@ impl DnsResolver {
             }
         }
 
-        let resolver = Arc::new(
-            Self::new(
-                doh_url,
-                normalized_doh_url_ech,
-                prefer_ipv6,
-                upstream_proxy.clone(),
-            )
-            .await?,
-        );
+        let mut resolver = Self::new(
+            doh_url,
+            normalized_doh_url_ech,
+            prefer_ipv6,
+            upstream_proxy,
+        )
+        .await?;
+        resolver.ech_dns_policy = ech_dns_policy;
+        let resolver = Arc::new(resolver);
 
         let mut guard = Self::shared_resolver_holder().write().await;
         Ok(guard
@@ -1861,6 +1916,7 @@ impl DnsResolver {
 
         Ok(Self {
             resolver,
+            ech_dns_policy: EchDnsPolicy::default(),
             doh_ip: None,
             force_doh_get_ip: false,
             doh_ech: None,
@@ -1926,7 +1982,8 @@ impl DnsResolver {
             return Ok(None);
         }
 
-        info!("Looking up HTTPS record for ECH config: {}", domain);
+        let query_name = self.ech_dns_policy.query_name(domain);
+        info!("Looking up HTTPS record for ECH config: {} (query: {})", domain, query_name);
 
         let (notify, is_leader) = {
             let mut inflight = self.ech_inflight.lock().await;
@@ -1969,7 +2026,7 @@ impl DnsResolver {
         let lookup = match tokio::time::timeout(
             self.resolve_timeout,
             self.resolver
-                .lookup(domain, hickory_resolver::proto::rr::RecordType::HTTPS),
+                .lookup(query_name, hickory_resolver::proto::rr::RecordType::HTTPS),
         )
         .await
         {
@@ -2261,9 +2318,10 @@ impl DnsResolver {
             return self.lookup_ip_via_doh_get(domain).await;
         }
 
+        let query_name = self.ech_dns_policy.query_name(domain);
         let start = std::time::Instant::now();
         let lookup =
-            match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(domain)).await
+            match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(query_name)).await
             {
                 Ok(Ok(lookup)) => lookup,
                 Ok(Err(e)) => {
@@ -2313,11 +2371,12 @@ impl DnsResolver {
 
     /// 用系统 DNS 解析（查表模式下表外域名的首选路径）
     async fn system_lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        let host = domain.trim_end_matches('.').to_string();
+        let query_name = self.ech_dns_policy.query_name(domain);
+        let host = query_name.trim_end_matches('.');
         #[cfg(test)]
         if let Some(addrs) = TEST_SYSTEM_DNS
             .get()
-            .and_then(|stub| stub.read().get(&host).cloned())
+            .and_then(|stub| stub.read().get(host).cloned())
         {
             return if addrs.is_empty() {
                 Err(DohProxyError::Dns(format!("System DNS failed for {}", domain)))
@@ -2910,7 +2969,9 @@ impl DnsResolver {
         };
         let start = std::time::Instant::now();
 
-        let bytes = Self::encode_query(domain, record_type)?;
+        // 仅替换 DNS 查询名，缓存、Host、TLS SNI 和证书校验保留真实域名。
+        let query_name = self.ech_dns_policy.query_name(domain);
+        let bytes = Self::encode_query(query_name, record_type)?;
 
         let response = upstream.query(&bytes).await?;
 
@@ -3466,6 +3527,8 @@ pub(crate) mod tests {
         resolver.doh_ech = Some(upstream);
         resolver.force_doh_get_ip = true;
         resolver.force_doh_get_ech = true;
+        // 这些测试验证原域名的加速、备用节点和防投毒行为，公共入口另有独立覆盖。
+        resolver.ech_dns_policy.enabled = false;
         resolver
     }
 
