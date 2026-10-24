@@ -8,6 +8,8 @@ use crate::cert::CertManager;
 use crate::dns::DnsResolver;
 use crate::ech::DohTlsConnector;
 use crate::error::{DohProxyError, Result};
+use crate::stats::STATS;
+use crate::upstream_pool::{Lane, Replay, UpstreamPool};
 use crate::ProxyConfig;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -40,6 +42,8 @@ pub struct DohProxyServer {
     cert_manager: Option<Arc<CertManager>>,
     local_addr: Arc<RwLock<Option<SocketAddr>>>,
     shutdown_tx: broadcast::Sender<()>,
+    /// 所有回环连接共用的上游连接池
+    pool: Arc<UpstreamPool>,
 }
 
 impl DohProxyServer {
@@ -155,6 +159,8 @@ impl DohProxyServer {
             )
         });
 
+        let pool = UpstreamPool::new(doh_tls_connector.clone());
+        pool.seed_network_signature(config.network_sig.as_deref());
         Ok(Self {
             config,
             doh_config_key,
@@ -162,12 +168,18 @@ impl DohProxyServer {
             cert_manager,
             local_addr: Arc::new(RwLock::new(None)),
             shutdown_tx,
+            pool,
         })
     }
 
     /// MITM 证书管理器（DoH 关闭时为 None）。Linux 的 WebView 要按主机预先放行它签发的叶子证书
     pub fn cert_manager(&self) -> Option<&Arc<CertManager>> {
         self.cert_manager.as_ref()
+    }
+
+    /// 上游连接池（FFI 换网通知时作废旧连接）
+    pub fn pool(&self) -> &Arc<UpstreamPool> {
+        &self.pool
     }
 
     /// Get the local address the server is bound to
@@ -206,6 +218,12 @@ impl DohProxyServer {
 
     /// Start the proxy server
     pub async fn start(&self) -> Result<()> {
+        let listener = self.bind().await?;
+        self.serve(listener).await
+    }
+
+    /// 绑定监听端口，返回后 [`Self::port`] 即可用；接着交给 [`Self::serve`]
+    pub async fn bind(&self) -> Result<TcpListener> {
         let bind_addr = format!("{}:{}", self.config.bind_addr, self.config.bind_port);
         let listener = TcpListener::bind(&bind_addr).await?;
 
@@ -213,9 +231,16 @@ impl DohProxyServer {
         *self.local_addr.write() = Some(local_addr);
 
         info!("Local proxy server listening on {}", local_addr);
+        Ok(listener)
+    }
 
+    /// 在已绑定的端口上接受连接，直到 [`Self::stop`]
+    pub async fn serve(&self, listener: TcpListener) -> Result<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mitm_scope: Arc<[String]> = self.config.mitm_hosts.clone().into();
+        crate::stats::spawn_reporter(self.shutdown_tx.subscribe());
+        self.pool.spawn_reaper(self.shutdown_tx.subscribe());
+        self.spawn_preconnect();
 
         loop {
             tokio::select! {
@@ -223,6 +248,8 @@ impl DohProxyServer {
                     match result {
                         Ok((stream, peer_addr)) => {
                             debug!("New connection from {}", peer_addr);
+                            crate::stats::STATS.loopback_accepts.inc();
+                            let _ = stream.set_nodelay(true);
 
                             let enable_doh = self.config.enable_doh;
                             let gateway_mode = self.config.gateway_mode;
@@ -230,6 +257,7 @@ impl DohProxyServer {
                             let h2_mitm = self.config.h2_mitm;
                             let mitm_scope = mitm_scope.clone();
                             let doh_tls_connector = self.doh_tls_connector.clone();
+                            let pool = self.pool.clone();
                             let cert_manager = self.cert_manager.clone();
 
                             tokio::spawn(async move {
@@ -240,6 +268,7 @@ impl DohProxyServer {
                                     if let Err(e) = handle_gateway_connection(
                                         stream,
                                         doh_tls_connector,
+                                        pool,
                                         cert_manager,
                                         mitm_connect,
                                         h2_mitm,
@@ -251,6 +280,7 @@ impl DohProxyServer {
                                     stream,
                                     enable_doh,
                                     doh_tls_connector,
+                                    pool,
                                     cert_manager,
                                     h2_mitm,
                                     mitm_scope,
@@ -278,6 +308,37 @@ impl DohProxyServer {
     pub fn stop(&self) {
         crate::select::Selector::uninstall();
         let _ = self.shutdown_tx.send(());
+        self.pool.clear();
+    }
+
+    /// 启动预连：等优选出结果（不在待定期抢先定下地址族亲和），给 `preconnect_hosts`
+    /// 各预建一条网关道的上游连接，首个请求不用再等握手
+    fn spawn_preconnect(&self) {
+        if !self.config.gateway_mode || self.config.preconnect_hosts.is_empty() {
+            return;
+        }
+        let Some(edge) = self.doh_tls_connector.dns_resolver().map(|r| r.edge_pin().clone())
+        else {
+            return;
+        };
+        let hosts = self.config.preconnect_hosts.clone();
+        let pool = Arc::downgrade(&self.pool);
+        let mut shutdown = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let pin = tokio::select! {
+                pin = edge.wait_settled(deadline) => pin,
+                _ = shutdown.recv() => return,
+            };
+            if pin == crate::edge_pin::Pin::Pending {
+                return;
+            }
+            let Some(pool) = pool.upgrade() else { return };
+            for host in hosts {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.preconnect(Lane::Gateway, &host, 443).await });
+            }
+        });
     }
 }
 
@@ -286,6 +347,7 @@ async fn handle_connection(
     client: TcpStream,
     enable_doh: bool,
     doh_tls_connector: Arc<DohTlsConnector>,
+    pool: Arc<UpstreamPool>,
     cert_manager: Option<Arc<CertManager>>,
     h2_mitm: bool,
     mitm_scope: Arc<[String]>,
@@ -321,6 +383,7 @@ async fn handle_connection(
                 writer,
                 &target,
                 doh_tls_connector,
+                pool,
                 cert_manager,
                 h2_mitm,
             )
@@ -406,6 +469,7 @@ async fn handle_connect_mitm(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     target: &str,
     doh_tls_connector: Arc<DohTlsConnector>,
+    pool: Arc<UpstreamPool>,
     cert_manager: Arc<CertManager>,
     h2_mitm: bool,
 ) -> Result<()> {
@@ -445,7 +509,7 @@ async fn handle_connect_mitm(
             }
         };
         info!("Client TLS handshake complete for {} (h2 MITM)", host);
-        return mitm_serve(client_tls, host, port, doh_tls_connector).await;
+        return mitm_serve(client_tls, host, port, pool).await;
     }
 
     let server_tls = match doh_tls_connector.connect(&host, port).await {
@@ -516,13 +580,13 @@ async fn handle_connect_mitm(
 async fn handle_gateway_connection(
     stream: TcpStream,
     connector: Arc<DohTlsConnector>,
+    pool: Arc<UpstreamPool>,
     cert_manager: Option<Arc<CertManager>>,
     mitm_connect: bool,
     h2_mitm: bool,
     mitm_scope: Arc<[String]>,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
-    let pool: GatewayPool = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     let service = service_fn(move |req: Request<Incoming>| {
         let connector = connector.clone();
@@ -539,12 +603,12 @@ async fn handle_gateway_connection(
                     .map(|a| !is_cf_challenge_host(a.host()) && in_mitm_scope(&mitm_scope, a.host()))
                     .unwrap_or(false);
                 if mitm_connect && use_mitm {
-                    gateway_handle_connect(req, connector, cert_manager, h2_mitm).await
+                    gateway_handle_connect(req, connector, pool, cert_manager, h2_mitm).await
                 } else {
                     gateway_handle_connect_tunnel(req, connector).await
                 }
             } else {
-                gateway_forward_request(req, connector, pool, None).await
+                gateway_forward_request(req, pool, Lane::Gateway, None).await
             }
         }
     });
@@ -560,18 +624,6 @@ async fn handle_gateway_connection(
 type GatewayBody = BoxBody<Bytes, hyper::Error>;
 type GatewayResponse = std::result::Result<Response<GatewayBody>, Infallible>;
 
-/// 只缓存 HTTP/2 sender（可 clone 多路复用），HTTP/1.1 不缓存。
-type GatewayPool = Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<String, hyper::client::conn::http2::SendRequest<Incoming>>,
-    >,
->;
-
-enum GatewaySender {
-    H2(hyper::client::conn::http2::SendRequest<Incoming>),
-    H1(hyper::client::conn::http1::SendRequest<Incoming>),
-}
-
 fn gateway_error_response(status: u16, msg: &str) -> Response<GatewayBody> {
     let body = Full::new(Bytes::from(msg.to_owned()))
         .map_err(|never| match never {})
@@ -583,11 +635,11 @@ fn gateway_error_response(status: u16, msg: &str) -> Response<GatewayBody> {
         .unwrap()
 }
 
-/// Forward a plain HTTP request to the real server via TLS+ECH (HTTP/2 preferred).
+/// 把明文请求经共用的上游连接池转发到真实服务端（TLS + ECH，h2 优先）
 async fn gateway_forward_request(
     req: Request<Incoming>,
-    connector: Arc<DohTlsConnector>,
-    pool: GatewayPool,
+    pool: Arc<UpstreamPool>,
+    lane: Lane,
     forced_target: Option<(String, u16)>,
 ) -> GatewayResponse {
     // MITM 单 host 场景由 forced_target 指定目标；gateway 反代场景从 Host 头解析
@@ -606,91 +658,20 @@ async fn gateway_forward_request(
             }
 
             match gateway_parse_host(&host_header) {
+                // 指向本机的请求（端口探测、误配）不转发：转回网关自己只会撞上一次 TLS 失败
+                Some((host, _)) if is_loopback_host(&host) => {
+                    return Ok(gateway_error_response(400, "Loopback host is not proxied"));
+                }
                 Some(hp) => hp,
                 None => return Ok(gateway_error_response(400, "Invalid Host header")),
             }
         }
     };
     let host_key = format!("{}:{}", host, port);
+    let started = std::time::Instant::now();
+    STATS.gw_requests.inc();
 
     debug!("Gateway {} {} -> {}", req.method(), req.uri(), host_key);
-
-    // Try to get a pooled H2 sender (H1 is not pooled)
-    let mut sender: Option<GatewaySender> = {
-        let mut p = pool.lock().await;
-        match p.get(&host_key) {
-            Some(s) if s.is_ready() => Some(GatewaySender::H2(s.clone())),
-            _ => {
-                p.remove(&host_key);
-                None
-            }
-        }
-    };
-
-    // Create new connection if needed
-    if sender.is_none() {
-        let tls = match connector.connect_h2(&host, port).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Gateway connect failed for {}: {}", host_key, e);
-                return Ok(gateway_error_response(
-                    502,
-                    &format!("Connect failed: {}", e),
-                ));
-            }
-        };
-
-        // Check negotiated ALPN
-        let alpn = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-        let is_h2 = alpn.as_deref() == Some(b"h2");
-        let io = TokioIo::new(tls);
-
-        if is_h2 {
-            debug!("Gateway: HTTP/2 connection to {}", host_key);
-            let (s, conn) = match hyper::client::conn::http2::handshake(
-                hyper_util::rt::TokioExecutor::new(),
-                io,
-            )
-            .await
-            {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!("Gateway H2 handshake failed for {}: {}", host_key, e);
-                    return Ok(gateway_error_response(
-                        502,
-                        &format!("H2 handshake failed: {}", e),
-                    ));
-                }
-            };
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    debug!("Gateway H2 conn closed: {}", e);
-                }
-            });
-            let s_clone = s.clone();
-            sender = Some(GatewaySender::H2(s));
-            pool.lock().await.insert(host_key.clone(), s_clone);
-        } else {
-            debug!("Gateway: HTTP/1.1 connection to {}", host_key);
-            let (s, conn) = match hyper::client::conn::http1::handshake(io).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!("Gateway H1 handshake failed for {}: {}", host_key, e);
-                    return Ok(gateway_error_response(
-                        502,
-                        &format!("H1 handshake failed: {}", e),
-                    ));
-                }
-            };
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    debug!("Gateway H1 conn closed: {}", e);
-                }
-            });
-            // H1 不能 clone/多路复用，不入池
-            sender = Some(GatewaySender::H1(s));
-        }
-    }
 
     // Rewrite URI: 客户端发来的是相对路径 /path，HTTP/2 需要绝对 URI（:authority + :scheme）
     let mut req = req;
@@ -708,22 +689,19 @@ async fn gateway_forward_request(
         *req.uri_mut() = new_uri;
     }
 
-    // Forward the request
-    let result = match sender.unwrap() {
-        GatewaySender::H2(mut s) => s.send_request(req).await,
-        GatewaySender::H1(mut s) => s.send_request(req).await,
-    };
-
-    match result {
-        Ok(resp) => Ok(resp.map(|b| b.boxed())),
+    let replay = Replay::capture(&req);
+    match pool
+        .forward(lane, &host, port, req.map(|body| body.boxed()), replay)
+        .await
+    {
+        Ok(resp) => {
+            STATS.gw_ttfb.record(started.elapsed());
+            Ok(resp)
+        }
         Err(e) => {
             warn!("Gateway forward failed for {}: {}", host_key, e);
-            // Remove broken connection from pool
-            pool.lock().await.remove(&host_key);
-            Ok(gateway_error_response(
-                502,
-                &format!("Forward failed: {}", e),
-            ))
+            STATS.gw_502.inc();
+            Ok(gateway_error_response(502, &e.to_string()))
         }
     }
 }
@@ -734,19 +712,17 @@ async fn mitm_serve<I>(
     client_io: I,
     host: String,
     port: u16,
-    connector: Arc<DohTlsConnector>,
+    pool: Arc<UpstreamPool>,
 ) -> Result<()>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(client_io);
-    // 单 host 连接池：h2 上游 sender 可 clone 多路复用
-    let pool: GatewayPool = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    // 上游走共用池的 Mitm 道（与 Dart 的 Gateway 道分开）
     let service = service_fn(move |req: Request<Incoming>| {
-        let connector = connector.clone();
         let pool = pool.clone();
         let target = (host.clone(), port);
-        async move { gateway_forward_request(req, connector, pool, Some(target)).await }
+        async move { gateway_forward_request(req, pool, Lane::Mitm, Some(target)).await }
     });
 
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -813,6 +789,7 @@ async fn gateway_handle_connect_tunnel(
 async fn gateway_handle_connect(
     req: Request<Incoming>,
     connector: Arc<DohTlsConnector>,
+    pool: Arc<UpstreamPool>,
     cert_manager: Option<Arc<CertManager>>,
     h2_mitm: bool,
 ) -> GatewayResponse {
@@ -851,6 +828,7 @@ async fn gateway_handle_connect(
                     &host_clone,
                     port,
                     connector_clone,
+                    pool,
                     cert_manager,
                     h2_mitm,
                 )
@@ -876,6 +854,7 @@ async fn gateway_mitm_upgraded<I>(
     host: &str,
     port: u16,
     connector: Arc<DohTlsConnector>,
+    pool: Arc<UpstreamPool>,
     cert_manager: Arc<CertManager>,
     h2_mitm: bool,
 ) -> Result<()>
@@ -890,7 +869,7 @@ where
             .accept(client_io)
             .await
             .map_err(DohProxyError::Io)?;
-        return mitm_serve(client_tls, host.to_string(), port, connector).await;
+        return mitm_serve(client_tls, host.to_string(), port, pool).await;
     }
 
     // Connect to real server with TLS+ECH
@@ -932,6 +911,15 @@ fn gateway_parse_host(host_header: &str) -> Option<(String, u16)> {
     } else {
         Some((host_header.to_string(), 443))
     }
+}
+
+/// `localhost` 或回环地址字面量
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// 判断是否为 Cloudflare 验证（Turnstile）基础设施域名。
@@ -1051,7 +1039,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_mitm_scope, is_cf_challenge_host};
+    use super::{gateway_parse_host, in_mitm_scope, is_cf_challenge_host, is_loopback_host};
 
     /// MITM 范围为空 = 不限；有值时按后缀匹配，同名前缀的伪装域不算
     #[test]
@@ -1082,5 +1070,17 @@ mod tests {
         assert!(!is_cf_challenge_host("challenges.cloudflare.com.evil.test"));
         assert!(!is_cf_challenge_host("linux.do"));
         assert!(!is_cf_challenge_host(""));
+    }
+
+    /// 网关不转发指向本机的 Host（端口探测会带 `Host: 127.0.0.1:<网关端口>`）
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for host in ["localhost", "LOCALHOST.", "127.0.0.1", "127.8.9.10", "::1"] {
+            assert!(is_loopback_host(host), "{}", host);
+        }
+        for host in ["linux.do", "localhost.linux.do", "10.0.0.1", "::2", ""] {
+            assert!(!is_loopback_host(host), "{}", host);
+        }
+        assert_eq!(gateway_parse_host("[::1]:8080"), Some(("::1".to_string(), 8080)));
     }
 }

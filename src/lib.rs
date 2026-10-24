@@ -19,8 +19,11 @@ pub mod ffi;
 pub mod probe;
 pub mod proxy;
 pub mod select;
+mod single_flight;
+pub mod stats;
 pub mod tls_crypto;
 pub mod upstream;
+pub mod upstream_pool;
 
 pub use error::DohProxyError;
 pub use proxy::DohProxyServer;
@@ -244,6 +247,9 @@ pub struct ProxyConfig {
     /// 启动时的网络签名（Dart 的连接类型集合）
     #[serde(default)]
     pub network_sig: Option<String>,
+    /// 启动后预建上游连接的主机（网关道、443 端口），优选出结果后才连
+    #[serde(default)]
+    pub preconnect_hosts: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -282,6 +288,7 @@ impl Default for ProxyConfig {
             extra_covered_hosts: Vec::new(),
             app_version: None,
             network_sig: None,
+            preconnect_hosts: Vec::new(),
         }
     }
 }

@@ -328,8 +328,18 @@ pub async fn probe_once(
     tls: Arc<ClientConfig>,
     t: &ProbeTimeouts,
 ) -> ProbeOutcome {
+    probe_once_at(target, 443, tls, t).await
+}
+
+/// 将端口参数与探测流程分开，测试可保留一个已绑定但未监听的本机端口。
+async fn probe_once_at(
+    target: &ProbeTarget,
+    port: u16,
+    tls: Arc<ClientConfig>,
+    t: &ProbeTimeouts,
+) -> ProbeOutcome {
     let start = Instant::now();
-    let addr = SocketAddr::new(target.ip, 443);
+    let addr = SocketAddr::new(target.ip, port);
     let tcp = match tokio::time::timeout(t.tcp, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) => return failed_outcome(target.ip, start, ProbeFailure::TcpConnect, false),
@@ -544,22 +554,25 @@ mod tests {
 
     #[tokio::test]
     async fn closed_port_is_tcp_connect_failure() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _port = listener.local_addr().unwrap().port();
-        drop(listener);
-        // 探测固定打 443；本机 443 没有监听时就是 TcpConnect（CI 容器里不会开 443）
+        // 保留绑定但不监听的套接字，端口不会被其他进程抢占，也不依赖本机 443 服务。
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
         let tls = build_probe_tls_config(None, &test_roots(), Arc::new(crate::tls_crypto::build_provider()))
             .unwrap();
         let target = ProbeTarget {
             ip: "127.0.0.1".parse().unwrap(),
             inner_sni: "linux.do",
         };
-        let outcome = probe_once(&target, tls, &tiny_timeouts()).await;
+        // Windows 本机拒绝连接约 2 秒后才返回；500ms 只会测到 TCP 超时。
+        let timeouts = ProbeTimeouts {
+            tcp: Duration::from_secs(5),
+            ..tiny_timeouts()
+        };
+        let outcome = probe_once_at(&target, port, tls, &timeouts).await;
         assert!(!outcome.ok);
-        assert!(matches!(
-            outcome.failure,
-            Some(ProbeFailure::TcpConnect) | Some(ProbeFailure::TlsTimeout) | Some(ProbeFailure::Tls(_))
-        ));
+        assert_eq!(outcome.failure, Some(ProbeFailure::TcpConnect));
+        drop(socket);
     }
 
     #[tokio::test]

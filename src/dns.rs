@@ -4,6 +4,8 @@ use crate::edge_pin::EdgePin;
 use crate::ech_dns_policy::EchDnsPolicy;
 use crate::error::{DohProxyError, Result};
 use crate::select::{Selector, SELECT_LOOKUP_WAIT_SECS};
+use crate::single_flight::{Joined, SingleFlight, Waited};
+use crate::stats::STATS;
 use crate::UpstreamProxyConfig;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -25,13 +27,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::lookup_host;
-use tokio::sync::{Mutex, Notify, RwLock as AsyncRwLock};
+use tokio::sync::{Notify, RwLock as AsyncRwLock};
 use tracing::{debug, info, warn};
 
 /// 缓存条目上限
 const MAX_CACHE_SIZE: usize = 1000;
 /// TTL 下限（秒）
 const MIN_TTL_SECS: u64 = 60;
+/// Cloudflare 的公共 ECH 入口：解析到 CF 共享网段，开了 ECH 的 CF 站点都能经这些
+/// 地址连（内层 SNI 仍是原域名，2026-10-21 实测 linux.do ECH Accepted）
+const CLOUDFLARE_ECH_ENTRY: &str = "cloudflare-ech.com";
 /// TTL 上限（秒）
 const MAX_TTL_SECS: u64 = 1800;
 /// 默认 TTL（秒），无法获取时使用
@@ -40,6 +45,8 @@ const DEFAULT_TTL_SECS: u64 = 300;
 const CLEANUP_INTERVAL: u64 = 100;
 /// ECH 负结果（确定无 ECH）缓存时长，取短值以便域名启用 ECH 后尽快生效
 const ECH_NEGATIVE_TTL_SECS: u64 = 60;
+/// ECH 查询出错（不是「确定没有」）后的短负缓存：免得接下来每次建连都再白等一轮出错的查询
+const ECH_ERROR_NEGATIVE_TTL_SECS: u64 = 15;
 /// 有备用节点时，主客户端（系统 DNS）的连接超时（含 DNS 解析和 TLS 握手），超时即改走备用节点
 const DOH_PRIMARY_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// 备用节点客户端的连接超时，按节点数平分到每个 IP
@@ -50,8 +57,10 @@ const DOH_BOOTSTRAP_PREFER_SECS: u64 = 600;
 const DOH_FAILURES_BEFORE_COOLDOWN: u32 = 4;
 /// DoH 服务器暂停使用的时长，到期后再试
 const DOH_COOLDOWN_SECS: u64 = 30;
-/// 同域名并发查询时，跟随者等待领头查询的上限，避免错过通知后一直挂起
+/// 同域名并发查询时，跟随者等待领头查询的上限
 const INFLIGHT_WAIT_TIMEOUT_SECS: u64 = 15;
+/// 跟随者遇到领头者被取消时最多重新排队几次，之后自己直接查
+const SINGLE_FLIGHT_ATTEMPTS: usize = 3;
 /// DoH 服务器拒绝令牌（401/403）后暂停使用的时长；换了新令牌会立即恢复
 const DOH_AUTH_REJECTED_COOLDOWN_SECS: u64 = 60;
 /// DoH 请求固定带的 User-Agent：安卓上最常见的 HTTP 库，混在普通 App 流量里不显眼。
@@ -545,8 +554,9 @@ pub struct DnsResolver {
     ip_cache: Arc<RwLock<HashMap<String, CachedIpAddrs>>>,
     /// 服务端 retry_configs 给的新钥匙：domain -> (钥匙, 过期时间)，优先于表和缓存
     ech_overrides: Arc<RwLock<HashMap<String, (EchConfigListBytes<'static>, std::time::Instant)>>>,
-    ech_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    ip_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    /// 同域名并发查询合并（见 single_flight.rs）
+    ech_inflight: Arc<SingleFlight<Option<EchConfigListBytes<'static>>>>,
+    ip_inflight: Arc<SingleFlight<Vec<IpAddr>>>,
     /// 出站钉选（优选赢家、地址族亲和、粘性 IP、RTT），与本 resolver 同生命周期。
     /// resolver 只负责解析，连哪个地址、走哪个地址族都由它决定（见 edge_pin.rs）
     edge_pin: Arc<EdgePin>,
@@ -1074,6 +1084,23 @@ impl RouteTableStore {
             .filter(|table| table.is_usable(now))
     }
 
+    /// 手头现成可用的表，不等拉取：过期但可用时顺带后台刷新，没有可用表时触发一次拉取
+    fn current_nowait(self: &Arc<Self>) -> Option<Arc<RouteTable>> {
+        let now = Instant::now();
+        let table = self.table.read().clone();
+        match table {
+            Some(table) if table.is_fresh(now) => Some(table),
+            Some(table) if table.is_usable(now) => {
+                self.spawn_refresh();
+                Some(table)
+            }
+            _ => {
+                self.spawn_refresh();
+                None
+            }
+        }
+    }
+
     fn spawn_refresh(self: &Arc<Self>) {
         if self.in_backoff(Instant::now()) {
             return;
@@ -1440,6 +1467,13 @@ impl DnsResolver {
         let host = self.doh_ip.as_ref()?.host().to_string();
         let store = Self::route_table_registry().read().get(&host).cloned()?;
         store.current().await
+    }
+
+    /// 同上，但不等拉取：只给手头现成可用的表
+    fn route_table_nowait(&self) -> Option<Arc<RouteTable>> {
+        let host = self.doh_ip.as_ref()?.host().to_string();
+        let store = Self::route_table_registry().read().get(&host).cloned()?;
+        store.current_nowait()
     }
 
     fn accel_upstreams() -> &'static RwLock<HashMap<String, DohUpstream>> {
@@ -1925,8 +1959,12 @@ impl DnsResolver {
             ech_negative_cache: Arc::new(RwLock::new(HashMap::new())),
             ip_cache: Arc::new(RwLock::new(HashMap::new())),
             ech_overrides: Arc::new(RwLock::new(HashMap::new())),
-            ech_inflight: Arc::new(Mutex::new(HashMap::new())),
-            ip_inflight: Arc::new(Mutex::new(HashMap::new())),
+            ech_inflight: Arc::new(SingleFlight::new(Duration::from_secs(
+                INFLIGHT_WAIT_TIMEOUT_SECS,
+            ))),
+            ip_inflight: Arc::new(SingleFlight::new(Duration::from_secs(
+                INFLIGHT_WAIT_TIMEOUT_SECS,
+            ))),
             edge_pin: Arc::new(EdgePin::new(prefer_ipv6)),
             prefer_ipv6,
             resolve_timeout,
@@ -1985,42 +2023,41 @@ impl DnsResolver {
         let query_name = self.ech_dns_policy.query_name(domain);
         info!("Looking up HTTPS record for ECH config: {} (query: {})", domain, query_name);
 
-        let (notify, is_leader) = {
-            let mut inflight = self.ech_inflight.lock().await;
-            if let Some(existing) = inflight.get(domain) {
-                (existing.clone(), false)
-            } else {
-                let notify = Arc::new(Notify::new());
-                inflight.insert(domain.to_string(), notify.clone());
-                (notify, true)
-            }
-        };
-
-        if !is_leader {
-            // 领头查询可能在这里注册等待前就已通知，设上限避免一直挂起
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS),
-                notify.notified(),
-            )
-            .await;
-            let cache = self.ech_cache.read();
-            if let Some(cached) = cache.get(domain) {
-                if cached.expires_at > std::time::Instant::now() {
-                    debug!("ECH config cache hit for {}", domain);
-                    return Ok(Some(cached.config.clone()));
+        // 同一域名并发只查一次；领头者被取消时跟随者接任，不白等
+        for _ in 0..SINGLE_FLIGHT_ATTEMPTS {
+            match self.ech_inflight.join(domain) {
+                Joined::Leader(leader) => {
+                    let result = self.lookup_ech_config_leader(domain).await;
+                    // 覆盖域名有 Selector 的钥匙兜底，不记；其余查询出错短暂记为无 ECH
+                    if result.is_err() && !EdgePin::is_covered(domain) {
+                        self.put_ech_negative_for(
+                            domain,
+                            Duration::from_secs(ECH_ERROR_NEGATIVE_TTL_SECS),
+                        );
+                    }
+                    leader.finish(&result);
+                    return result;
                 }
+                Joined::Follower(rx) => match self.ech_inflight.wait(rx).await {
+                    Waited::Done(result) => return result.map_err(DohProxyError::Dns),
+                    Waited::TimedOut => return Ok(None),
+                    Waited::Abandoned => {}
+                },
             }
-            return Ok(None);
         }
+        self.lookup_ech_config_leader(domain).await
+    }
 
+    /// 单飞的领头者：查 HTTPS 记录，出错 / 超时 / 没有 ECH 时再走 DoH GET
+    async fn lookup_ech_config_leader(
+        &self,
+        domain: &str,
+    ) -> Result<Option<EchConfigListBytes<'static>>> {
         if self.force_doh_get_ech {
-            let result = self.lookup_ech_config_via_doh_get(domain).await;
-            let mut inflight = self.ech_inflight.lock().await;
-            inflight.remove(domain);
-            notify.notify_waiters();
-            return result;
+            return self.lookup_ech_config_via_doh_get(domain).await;
         }
 
+        let query_name = self.ech_dns_policy.query_name(domain);
         let start = std::time::Instant::now();
         // Query HTTPS record
         let lookup = match tokio::time::timeout(
@@ -2042,11 +2079,7 @@ impl DnsResolver {
             },
             Err(_) => {
                 warn!("ECH HTTPS lookup timed out for {}, skipping ECH", domain);
-                let result = self.lookup_ech_config_via_doh_get(domain).await;
-                let mut inflight = self.ech_inflight.lock().await;
-                inflight.remove(domain);
-                notify.notify_waiters();
-                return result;
+                return self.lookup_ech_config_via_doh_get(domain).await;
             }
         };
 
@@ -2076,20 +2109,13 @@ impl DnsResolver {
                         start.elapsed().as_millis(),
                         ttl_secs,
                     );
-                    let mut inflight = self.ech_inflight.lock().await;
-                    inflight.remove(domain);
-                    notify.notify_waiters();
                     return Ok(Some(ech_config));
                 }
             }
         }
 
         warn!("No ECH config found in HTTPS record for {}", domain);
-        let result = self.lookup_ech_config_via_doh_get(domain).await;
-        let mut inflight = self.ech_inflight.lock().await;
-        inflight.remove(domain);
-        notify.notify_waiters();
-        result
+        self.lookup_ech_config_via_doh_get(domain).await
     }
 
     /// 从 HTTPS/SVCB 记录中提取 ECH 配置和 IP hint
@@ -2167,17 +2193,36 @@ impl DnsResolver {
             return Ok(vec![ip]);
         }
         let lookup_start = Instant::now();
+        let result = self.lookup_ip_inner(domain, lookup_start).await;
+        STATS.lookup_ip.record(lookup_start.elapsed());
+        result
+    }
 
+    async fn lookup_ip_inner(&self, domain: &str, lookup_start: Instant) -> Result<Vec<IpAddr>> {
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
 
-        // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
-        let table = self.active_route_table().await;
-
-        // 一等：优选覆盖的域名有赢家（EdgePin 钉住）时不再解析，赢家在前、表地址兜底；
-        // 等待竞速与等待拉表共用从 lookup 开始算的同一个 deadline
+        // 一等：优选覆盖的域名有赢家（EdgePin 钉住）时不再解析，赢家在前、表地址兜底。
+        // 等赢家与等拉表同时进行、共用从 lookup 开始算的同一个 deadline：赢家先到就不再等表
+        // （只用手头现成的表），没有赢家再接着等表。非覆盖域名不等赢家
         let deadline = lookup_start + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
-        if let Some(winner) = self.edge_pin.settled_winner(domain, deadline).await {
+        let table_wait = self.active_route_table();
+        tokio::pin!(table_wait);
+        let winner_wait = self.edge_pin.settled_winner(domain, deadline);
+        tokio::pin!(winner_wait);
+        let mut table: Option<Option<Arc<RouteTable>>> = None;
+        let winner = loop {
+            tokio::select! {
+                winner = &mut winner_wait => break winner,
+                ready = &mut table_wait, if table.is_none() => {
+                    STATS.routes_wait.record(lookup_start.elapsed());
+                    table = Some(ready);
+                }
+            }
+        };
+        STATS.pin_wait.record(lookup_start.elapsed());
+        if let Some(winner) = winner {
+            let table = table.flatten().or_else(|| self.route_table_nowait());
             let mut addrs = vec![winner];
             if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
                 let mut extra = entry.addrs.clone();
@@ -2191,6 +2236,15 @@ impl DnsResolver {
             debug!("Selector winner first for {}", domain);
             return Ok(addrs);
         }
+        // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
+        let table = match table {
+            Some(table) => table,
+            None => {
+                let table = table_wait.await;
+                STATS.routes_wait.record(lookup_start.elapsed());
+                table
+            }
+        };
         if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
             if !entry.addrs.is_empty() {
                 let mut addrs = entry.addrs.clone();
@@ -2216,40 +2270,24 @@ impl DnsResolver {
 
         debug!("Looking up IP for {}", domain);
 
-        let (notify, is_leader) = {
-            let mut inflight = self.ip_inflight.lock().await;
-            if let Some(existing) = inflight.get(domain) {
-                (existing.clone(), false)
-            } else {
-                let notify = Arc::new(Notify::new());
-                inflight.insert(domain.to_string(), notify.clone());
-                (notify, true)
-            }
-        };
-
-        if !is_leader {
-            // 领头查询可能在这里注册等待前就已通知，设上限避免一直挂起
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS),
-                notify.notified(),
-            )
-            .await;
-            let cache = self.ip_cache.read();
-            if let Some(cached) = cache.get(domain) {
-                if cached.expires_at > std::time::Instant::now() {
-                    debug!("IP cache hit for {}", domain);
-                    return Ok(cached.addrs.clone());
+        // 同一域名并发只解析一次；领头者被取消时跟随者接任，不白等
+        for _ in 0..SINGLE_FLIGHT_ATTEMPTS {
+            match self.ip_inflight.join(domain) {
+                Joined::Leader(leader) => {
+                    let result = self.resolve_ip_chain(domain, system_first).await;
+                    leader.finish(&result);
+                    return result;
                 }
+                Joined::Follower(rx) => match self.ip_inflight.wait(rx).await {
+                    Waited::Done(result) => return result.map_err(DohProxyError::Dns),
+                    Waited::TimedOut => {
+                        return Err(DohProxyError::Dns(format!("No IP found for {}", domain)))
+                    }
+                    Waited::Abandoned => {}
+                },
             }
-            return Err(DohProxyError::Dns(format!("No IP found for {}", domain)));
         }
-
-        // 结果（成功时已写缓存）出来后再唤醒跟随者，它们读的是缓存
-        let result = self.resolve_ip_chain(domain, system_first).await;
-        let mut inflight = self.ip_inflight.lock().await;
-        inflight.remove(domain);
-        notify.notify_waiters();
-        result
+        self.resolve_ip_chain(domain, system_first).await
     }
 
     /// 表 / 缓存都没命中时的解析链：（表外且 system_first）系统 DNS → DoH（出错再 DoH GET）。
@@ -2306,6 +2344,28 @@ impl DnsResolver {
                     }
                 }
                 Err(error) => debug!("System DNS lookup failed for {}: {}", domain, error),
+            }
+        }
+
+        // 未主动替换查询名时才尝试公共入口兜底。开关关闭必须同时禁用兜底；
+        // 已主动查过公共入口时不能以相同查询再请求一轮。
+        if self.ech_dns_policy.enabled
+            && screen.covered
+            && self.ech_dns_policy.query_name(domain).eq_ignore_ascii_case(domain)
+            && !domain.trim_end_matches('.').eq_ignore_ascii_case(CLOUDFLARE_ECH_ENTRY)
+        {
+            match self.doh_lookup_ip(CLOUDFLARE_ECH_ENTRY).await {
+                Ok((addrs, _)) => {
+                    if let Some(addrs) = screen.pass("public ECH entry", addrs) {
+                        info!(
+                            "No usable answer for {}, falling back to {} addresses {:?}",
+                            domain, CLOUDFLARE_ECH_ENTRY, addrs
+                        );
+                        self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(MIN_TTL_SECS));
+                        return Ok(addrs);
+                    }
+                }
+                Err(error) => debug!("Public ECH entry lookup failed for {}: {}", domain, error),
             }
         }
 
@@ -2686,7 +2746,11 @@ impl DnsResolver {
 
     /// 写入 ECH 负缓存（确定无 ECH 时调用）
     fn put_ech_negative(&self, domain: &str) {
-        let expires_at = std::time::Instant::now() + Duration::from_secs(ECH_NEGATIVE_TTL_SECS);
+        self.put_ech_negative_for(domain, Duration::from_secs(ECH_NEGATIVE_TTL_SECS));
+    }
+
+    fn put_ech_negative_for(&self, domain: &str, ttl: Duration) {
+        let expires_at = std::time::Instant::now() + ttl;
         let mut cache = self.ech_negative_cache.write();
         cache.insert(domain.to_string(), expires_at);
         if cache.len() > MAX_CACHE_SIZE {
@@ -3280,6 +3344,78 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("poisoned"), "{}", error);
     }
 
+    /// 按查询名作答的假 DoH 服务器：表里没有的名字回 `fallback`
+    async fn spawn_fake_doh_by_name(
+        table: Vec<(&'static str, Vec<IpAddr>)>,
+        fallback: Vec<IpAddr>,
+    ) -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        let table = Arc::new(table);
+        let fallback = Arc::new(fallback);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
+                let table = table.clone();
+                let fallback = fallback.clone();
+                tokio::spawn(async move {
+                    let (head, body) = read_request(&mut stream).await;
+                    if !is_doh_request(&mut stream, &head).await {
+                        return;
+                    }
+                    let query = query_message(&head, &body);
+                    let name = query.queries()[0].name().to_ascii();
+                    let name = name.trim_end_matches('.').to_string();
+                    seen.lock().push(name.clone());
+                    let answers = table
+                        .iter()
+                        .find(|(host, _)| *host == name)
+                        .map(|(_, ips)| ips.clone())
+                        .unwrap_or_else(|| (*fallback).clone());
+                    write_dns_answers(&mut stream, &query, &answers).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// 关闭策略同时关闭失败后的公共入口兜底，不暗中绕过用户选择。
+    #[tokio::test]
+    async fn disabled_policy_does_not_fall_back_to_public_ech_entry() {
+        let host = "poisoned-ech-entry.linux.do";
+        let (port, seen) = spawn_fake_doh_by_name(
+            vec![(CLOUDFLARE_ECH_ENTRY, ips(&["104.18.10.118"]))],
+            ips(&["31.13.94.36"]),
+        )
+        .await;
+        stub_system_dns(host, &["108.160.166.9"]);
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        let error = resolver.lookup_ip(host).await.unwrap_err();
+        assert!(error.to_string().contains("poisoned"), "{}", error);
+        let names = seen.lock().clone();
+        assert_eq!(names.len(), 2, "只查原域名的 A/AAAA: {:?}", names);
+        assert!(names.iter().all(|name| name == host));
+    }
+
+    /// 已主动替换到公共入口，失败时不能再重复发送同一组 A/AAAA。
+    #[tokio::test]
+    async fn proactive_public_entry_is_not_requested_again_on_failure() {
+        let host = "public-entry-no-repeat.linux.do";
+        let (port, seen) = spawn_fake_doh_by_name(vec![], ips(&["31.13.94.36"])).await;
+        stub_system_dns(CLOUDFLARE_ECH_ENTRY, &[]);
+        let mut resolver = resolver_with(unresolvable_upstream(port)).await;
+        resolver.ech_dns_policy.enabled = true;
+
+        let error = resolver.lookup_ip(host).await.unwrap_err();
+        assert!(error.to_string().contains("poisoned"), "{}", error);
+        let names = seen.lock().clone();
+        assert_eq!(names.len(), 2, "公共入口只查一组 A/AAAA: {:?}", names);
+        assert!(names.iter().all(|name| name == CLOUDFLARE_ECH_ENTRY));
+    }
+
     /// 非覆盖域名不做 CF 网段检查：DoH 给什么用什么，也不追加系统 DNS
     #[tokio::test]
     async fn non_covered_host_answers_are_untouched() {
@@ -3517,6 +3653,19 @@ pub(crate) mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         condition()
+    }
+
+    /// HTTPS 记录查询出错（这里是没有任何上游）后不留下在途登记：
+    /// 以前出错分支直接返回，之后同域名每次查 ECH 都当跟随者白等 15 s
+    #[tokio::test]
+    async fn ech_lookup_error_does_not_leave_a_stale_flight() {
+        let resolver = DnsResolver::with_resolver_config(ResolverConfig::new(), false)
+            .await
+            .unwrap();
+        assert_eq!(resolver.lookup_ech_config("stale-flight.example").await.unwrap(), None);
+        let start = std::time::Instant::now();
+        assert_eq!(resolver.lookup_ech_config("stale-flight.example").await.unwrap(), None);
+        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
     }
 
     async fn resolver_with(upstream: DohUpstream) -> DnsResolver {

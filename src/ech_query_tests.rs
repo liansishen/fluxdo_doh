@@ -14,6 +14,7 @@ use http_body_util::Full;
 use hyper::{body::Incoming, service::service_fn, Request, Response};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
+use tokio::sync::Mutex;
 
 #[test]
 fn only_forum_domains_use_public_ech_entry() {
@@ -25,6 +26,9 @@ fn only_forum_domains_use_public_ech_entry() {
         "ldstatic.com",
         "cdn.ldstatic.com",
         "CDN.LDSTATIC.COM.",
+        "idcflare.com",
+        "cdn.idcflare.com",
+        "CDN.IDCFLARE.COM.",
     ] {
         assert_eq!(
             EchDnsPolicy::default().query_name(host),
@@ -37,6 +41,8 @@ fn only_forum_domains_use_public_ech_entry() {
         "notlinux.do",
         "linux.do.example.com",
         "evil-ldstatic.com",
+        "notidcflare.com",
+        "idcflare.com.example.net",
         "challenges.cloudflare.com",
         "cloudflare-ech.com",
         "example.com.",

@@ -8,7 +8,9 @@
 - **ECH 支持**：加密 TLS 握手中的 SNI 字段（需要服务器支持）
 - **多 DOH 服务器**：支持 Cloudflare、Canadian Shield、Google、Quad9、DNSPod、腾讯 DNS、阿里 DNS
 - **跨平台**：支持 Windows、macOS、Linux、Android、iOS
-- **公共 ECH 入口策略**：默认将 `linux.do`、`ldstatic.com` 及子域名的 DNS 查询替换为 `cloudflare-ech.com`，支持关闭及自定义域名；真实 Host、TLS SNI、证书校验和缓存键不变。
+- **公共 ECH 入口策略**：默认将 `linux.do`、`ldstatic.com`、`idcflare.com` 及子域名的 DNS 查询替换为 `cloudflare-ech.com`，支持关闭及自定义域名；真实 Host、TLS SNI、证书校验和缓存键不变。关闭时也不使用公共入口兜底，仍查询原域名的 HTTPS/ECH 记录；主动公共查询失败不会重复请求同一入口。
+- **并发与连接复用**：DNS 查询单飞、握手竞速和预连；网关共享 h1/h2 连接池，换网、优选代数变化和停止时失效旧连接，仅对允许安全重放的请求重试。
+- **启动与诊断**：启动成功前同步绑定端口，网关拒绝回环 Host，FFI 可读取建连、握手、连接复用与解析等待统计。
 
 ## 项目结构
 
@@ -203,14 +205,11 @@ await service.stop();
 
 ### 桌面平台
 
-桌面平台通过进程方式运行代理，需要将编译好的可执行文件放到正确位置：
-
-- 开发时：`rust/target/release/doh_proxy_bin[.exe]`
-- 打包后：与应用程序同目录
+Windows 使用进程内 FFI，消费 `windows/runner/native/doh_proxy.dll`，通过主仓 `dart run tool/project_tasks.dart native:prepare windows --release` 构建和暂存，不再依赖代理可执行文件。其他桌面后端可使用进程 fallback；配置和预连主机参数与 FFI 保持一致。
 
 ## FFI 接口
 
-移动平台通过 FFI 调用 Rust 库：
+移动平台及 Windows 通过 FFI 调用 Rust 库：
 
 ```c
 // 启动代理，返回端口号（-1 表示失败）
@@ -218,6 +217,13 @@ int doh_proxy_start(int port, int prefer_ipv6);
 
 // 启动代理（指定 DOH 服务器）
 int doh_proxy_start_with_server(int port, int prefer_ipv6, const char* doh_server);
+
+// 按 JSON 配置启动；返回时已绑定端口，端口冲突立即返回 -1
+int doh_proxy_start_with_config_json(const char* config_json);
+
+// 读取累计网络统计 JSON；结果使用 doh_proxy_free_string 释放
+char* doh_proxy_net_stats();
+void doh_proxy_free_string(char* value);
 
 // 停止代理
 void doh_proxy_stop();

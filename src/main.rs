@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let enable_doh = !args.iter().any(|a| a == "--no-doh");
     let gateway_mode = args.iter().any(|a| a == "--gateway");
     let h2_mitm = args.iter().any(|a| a == "--h2-mitm");
+    let mitm_connect = !args.iter().any(|a| a == "--tunnel-connect");
 
     // Parse --doh <url> argument
     let doh_server = args
@@ -87,6 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let doh_bootstrap_ips = parse_ip_list("--doh-bootstrap-ips");
     let doh_ech_bootstrap_ips = parse_ip_list("--doh-ech-bootstrap-ips");
+    // 进程回退同样接受预连目标，列表来自当前站点且不扩展 Selector 覆盖范围。
+    let preconnect_hosts = parse_ip_list("--preconnect-hosts");
 
     // DoH 访问令牌走环境变量，不放命令行，避免出现在进程列表里
     let env_token = |name: &str| {
@@ -156,6 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upstream_proxy,
         server_ip,
         h2_mitm,
+        mitm_connect,
+        preconnect_hosts,
         doh_routes_url,
         select_mode,
         ..Default::default()

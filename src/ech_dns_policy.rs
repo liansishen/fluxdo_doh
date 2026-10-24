@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CLOUDFLARE_ECH_QUERY_NAME: &str = "cloudflare-ech.com";
-const BUILTIN_DOMAINS: [&str; 2] = ["linux.do", "ldstatic.com"];
+const BUILTIN_DOMAINS: [&str; 3] = ["linux.do", "ldstatic.com", "idcflare.com"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchDnsPolicy {
@@ -114,7 +114,7 @@ mod tests {
             "example.com.evil.net"
         );
         policy.enabled = false;
-        for host in ["linux.do", "cdn.ldstatic.com", "cdn.example.com"] {
+        for host in ["linux.do", "cdn.ldstatic.com", "cdn.idcflare.com", "cdn.example.com"] {
             assert_eq!(policy.query_name(host), host);
         }
         assert_eq!(policy.custom_domains, vec!["example.com"]);

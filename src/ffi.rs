@@ -179,6 +179,17 @@ fn start_server_with_config(config: ProxyConfig) -> c_int {
         }
     };
 
+    // 同步绑定端口：返回时端口已可用，不再固定睡 200 ms 等后台任务绑定
+    let listener = match rt.block_on(server.bind()) {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("Failed to bind DOH proxy server: {}", e);
+            server.stop();
+            return -1;
+        }
+    };
+    let actual_port = server.port().unwrap_or(0) as c_int;
+
     // Store the server
     let server_holder = get_server_holder();
     let server_clone = server.clone();
@@ -187,23 +198,10 @@ fn start_server_with_config(config: ProxyConfig) -> c_int {
         *guard = Some(server);
     });
 
-    // Start server in background
+    // Serve in background
     rt.spawn(async move {
-        if let Err(e) = server_clone.start().await {
+        if let Err(e) = server_clone.serve(listener).await {
             tracing::error!("DOH proxy server error: {}", e);
-        }
-    });
-
-    // Wait a bit for server to bind
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Get the actual port
-    let actual_port = rt.block_on(async {
-        let guard = server_holder.read().await;
-        if let Some(ref server) = *guard {
-            server.port().unwrap_or(0) as c_int
-        } else {
-            0
         }
     });
 
@@ -605,12 +603,20 @@ pub extern "C" fn doh_proxy_network_changed(sig: *const c_char) -> c_int {
         return -1;
     };
     match crate::select::Selector::global() {
+        // 有优选：换网由它判断（首个签名只是补登记），真换网时 EdgePin 代数递增、旧连接作废
         Some(selector) => {
             let _guard = get_runtime().enter();
             selector.on_network_changed(&sig);
             1
         }
-        None => 0,
+        // 没有优选：签名真变了就由连接池自己作废旧连接（换网后它们多半已经死了），首个签名只登记
+        None => {
+            let server = get_runtime().block_on(async { get_server_holder().read().await.clone() });
+            if let Some(server) = server {
+                server.pool().note_network_signature(&sig);
+            }
+            0
+        }
     }
 }
 
@@ -708,6 +714,16 @@ pub extern "C" fn doh_proxy_accel_request(
         })),
         Err(e) => error_json(&format!("{}", e)),
     }
+}
+
+/// 网络引擎计数（建连、握手、网关转发、解析等待）：`{"ok":true,"stats":{...}}`。
+/// 进程级累计，代理重启不清零。返回的字符串需要调用 doh_proxy_free_string 释放
+#[no_mangle]
+pub extern "C" fn doh_proxy_net_stats() -> *mut c_char {
+    json_to_c_string(serde_json::json!({
+        "ok": true,
+        "stats": crate::stats::snapshot(),
+    }))
 }
 
 /// Return shared DNS resolver cache statistics.

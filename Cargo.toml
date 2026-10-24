@@ -22,6 +22,11 @@ name = "race"
 path = "examples/race.rs"
 required-features = ["ech"]
 
+[[example]]
+name = "gateway_bench"
+path = "examples/gateway_bench.rs"
+required-features = ["ech"]
+
 [features]
 default = []
 # Enable ECH support (requires cmake, NASM on Windows)
@@ -69,6 +74,10 @@ ring = "0.17"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# 赛跑协调器等计时逻辑的测试用暂停时钟
+tokio = { version = "1", features = ["full", "test-util"] }
 
 # Android logging
 [target.'cfg(target_os = "android")'.dependencies]
