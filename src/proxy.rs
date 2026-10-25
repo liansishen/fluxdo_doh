@@ -1056,6 +1056,32 @@ mod tests {
         assert!(!in_mitm_scope(&scope, ""));
         let dotted = vec![".linux.do".to_string()];
         assert!(in_mitm_scope(&dotted, "linux.do"));
+
+        let forum_scope = vec![
+            "linux.do".to_string(),
+            "idcflare.com".to_string(),
+            "ldstatic.com".to_string(),
+        ];
+        for host in [
+            "idcflare.com",
+            "www.idcflare.com",
+            "LDSTATIC.COM.",
+            "cdn.ldstatic.com",
+            "cdn3.ldstatic.com",
+            "ping.ldstatic.com",
+            "linuxdo-uploads.s3.ldstatic.com",
+        ] {
+            assert!(in_mitm_scope(&forum_scope, host), "{} 应使用代理叶子", host);
+        }
+        for host in [
+            "notidcflare.com",
+            "notldstatic.com",
+            "ldstatic.com.evil.test",
+            "cdn.ldstatic.com.evil.test",
+            "challenges.cloudflare.com",
+        ] {
+            assert!(!in_mitm_scope(&forum_scope, host), "{} 必须保留隧道", host);
+        }
     }
 
     /// 挑战平台的主域和所有子域都必须走隧道，其余域名（含同名前缀的伪装域）不算

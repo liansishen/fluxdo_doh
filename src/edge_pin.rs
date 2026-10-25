@@ -177,7 +177,8 @@ impl EdgePin {
             .write() = normalized;
     }
 
-    /// 是否由本地优选覆盖：linux.do / *.linux.do，以及登记的额外主机名。
+    /// 是否由本地优选覆盖：linux.do / *.linux.do，以及登记的额外主机名（含其子域，
+    /// 另一个论坛 idcflare.com 就靠这条跟 linux.do 共用赢家）。
     /// 不按「表内地址在 CF 网段」扩展：别的 zone 可能用 CF 专用边缘，赢家 IP 对它们是 403，
     /// 会把无关失败算到赢家头上
     pub fn is_covered(host: &str) -> bool {
@@ -185,9 +186,14 @@ impl EdgePin {
         if host == "linux.do" || host.ends_with(".linux.do") {
             return true;
         }
-        EXTRA_COVERED_HOSTS
-            .get()
-            .is_some_and(|hosts| hosts.read().contains(&host))
+        EXTRA_COVERED_HOSTS.get().is_some_and(|hosts| {
+            hosts.read().iter().any(|extra| {
+                host == *extra
+                    || (host.len() > extra.len() + 1
+                        && host.ends_with(extra.as_str())
+                        && host.as_bytes()[host.len() - extra.len() - 1] == b'.')
+            })
+        })
     }
 
     // ---------- 建连方：问 ----------
@@ -807,5 +813,53 @@ mod tests {
             assert_eq!(route.first, None, "{} 不能再回到旧赢家", host);
         }
         assert_eq!(edge.settled_winner("linux.do", Instant::now()).await, None);
+    }
+
+    #[test]
+    fn extra_covered_hosts_match_subdomains_too() {
+        EdgePin::set_extra_covered_hosts(&[
+            "idcflare.com".to_string(),
+            "Atlas.Example.".to_string(),
+            "ldstatic.com".to_string(),
+        ]);
+        assert!(EdgePin::is_covered("idcflare.com"));
+        assert!(EdgePin::is_covered("www.idcflare.com"));
+        assert!(EdgePin::is_covered("IDCFLARE.COM."));
+        assert!(EdgePin::is_covered("atlas.example"));
+        assert!(!EdgePin::is_covered("notidcflare.com"));
+        assert!(!EdgePin::is_covered("idcflare.com.evil.test"));
+        assert!(EdgePin::is_covered("cdn.linux.do"));
+        assert!(EdgePin::is_covered("x.www.idcflare.com"));
+        assert!(EdgePin::is_covered("cdn.atlas.example"));
+        assert!(EdgePin::is_covered(" CDN.LDSTATIC.COM. "));
+        assert!(!EdgePin::is_covered("notldstatic.com"));
+        assert!(!EdgePin::is_covered("cdn.ldstatic.com.evil.test"));
+
+        // 两个论坛与静态资源不使用各自的 DNS 答案，统一钉在同一个赢家。
+        let edge = EdgePin::new(false);
+        let winner = ip("104.21.0.1");
+        edge.set_pin(Pin::Winner(winner));
+        for host in [
+            "linux.do",
+            "idcflare.com",
+            "www.idcflare.com",
+            "ldstatic.com",
+            "cdn.ldstatic.com",
+            "linuxdo-uploads.s3.ldstatic.com",
+        ] {
+            let route = edge.route(host, vec![ip("2001:db8::1")]);
+            assert!(route.pinned, "{} 应复用优选赢家", host);
+            assert_eq!(route.first, Some(winner));
+            assert_eq!(route.app_addrs(), vec![winner]);
+        }
+        let unrelated = edge.route("idcflare.com.evil.test", vec![ip("198.51.100.1")]);
+        assert!(!unrelated.pinned);
+
+        // 共享赢家不共享 Cookie；这里只验证不同覆盖主机的故障汇入同一赢家计数。
+        for host in ["linux.do", "www.idcflare.com", "cdn.ldstatic.com"] {
+            edge.report(host, winner, Outcome::Failed);
+        }
+        assert_eq!(edge.pin(), Pin::None);
+        EdgePin::set_extra_covered_hosts(&[]);
     }
 }

@@ -10,6 +10,7 @@
 - **跨平台**：支持 Windows、macOS、Linux、Android、iOS
 - **公共 ECH 入口策略**：默认将 `linux.do`、`ldstatic.com`、`idcflare.com` 及子域名的 DNS 查询替换为 `cloudflare-ech.com`，支持关闭及自定义域名；真实 Host、TLS SNI、证书校验和缓存键不变。关闭时也不使用公共入口兜底，仍查询原域名的 HTTPS/ECH 记录；主动公共查询失败不会重复请求同一入口。
 - **并发与连接复用**：DNS 查询单飞、握手竞速和预连；网关共享 h1/h2 连接池，换网、优选代数变化和停止时失效旧连接，仅对允许安全重放的请求重试。
+- **额外覆盖域名**：`extra_covered_hosts` 中的完整主机名及其子域和 `linux.do` 共用 Selector / EdgePin 赢家，仅按域名标签边界匹配。应用登记 `idcflare.com`、`ldstatic.com` 后，两论坛与静态资源统一走赢家；DNS / ECH 覆盖不改变真实 Host、证书校验或应用的 Cookie 站点隔离。
 - **启动与诊断**：启动成功前同步绑定端口，网关拒绝回环 Host，FFI 可读取建连、握手、连接复用与解析等待统计。
 
 ## 项目结构
@@ -151,6 +152,8 @@ cargo build --release --target aarch64-apple-ios
 Android/iOS 与桌面 FFI 的启动 JSON 使用 `ech_dns_policy` 字段；桌面独立进程使用 `--ech-dns-policy` 传递相同 JSON。独立 FFI 查询通过 `doh_proxy_set_ech_dns_policy_json` 更新策略，返回 `0` 表示成功，`-1` 表示参数错误。策略变更隔离解析器及缓存，并由应用重启网关，已有连接保留启动时策略快照。
 
 本地 Selector 优选、加速路由表和节点列表仍按既有优先级工作；公共入口替换只发生在实际 DNS 查询层，不覆盖这些本地网络扩展。
+
+MITM 范围由应用的 `mitm_hosts` 独立限定；Linux WebView 为 `linux.do`、`idcflare.com`、`ldstatic.com` 及其子域使用代理签发的叶子证书，已知静态资源主机在代理启动后预放行。范围外仍走端到端 TLS 隧道，不因登记优选覆盖域名而放宽证书信任。
 
 修改该策略接口后需重新构建目标平台原生库和桌面可执行文件，不能混用旧二进制。公网 ECH 冒烟测试位于 `tests/cloudflare_ech.rs`，默认忽略，需要显式运行。
 
