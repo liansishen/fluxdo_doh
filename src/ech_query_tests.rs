@@ -151,8 +151,16 @@ async fn forum_queries_share_public_entry_and_keep_original_host_cache() {
                         response
                             .set_id(query.id())
                             .set_message_type(MessageType::Response)
-                            .add_query(question.clone())
-                            .add_answer(Record::from_rdata(question.name().clone(), 120, data));
+                            .add_query(question.clone());
+                        if record_type != RecordType::HTTPS
+                            || !matches!(name.as_str(), "cdn.idcflare.com." | "cdn.custom.example.")
+                        {
+                            response.add_answer(Record::from_rdata(
+                                question.name().clone(),
+                                120,
+                                data,
+                            ));
+                        }
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .header("content-type", "application/dns-message")
@@ -236,5 +244,15 @@ async fn forum_queries_share_public_entry_and_keep_original_host_cache() {
     assert!(queries.lock().await[12..15]
         .iter()
         .all(|(name, _)| name == "ldstatic.com."));
+    for host in ["cdn.idcflare.com", "cdn.custom.example"] {
+        let before = queries.lock().await.len();
+        let normal = resolver.lookup_host(host, true).await.unwrap();
+        assert!(normal.ech_config.is_none(), "{host} 不得借公共 ECH 钥匙");
+        let observed = queries.lock().await;
+        assert_eq!(observed.len(), before + 3, "不得追加共享钥匙查询");
+        assert!(observed[before..]
+            .iter()
+            .all(|(name, _)| name == &format!("{host}.")));
+    }
     server.abort();
 }
