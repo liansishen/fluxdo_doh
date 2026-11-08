@@ -16,6 +16,7 @@
 //! GOAWAY 不会连带 Dart 的请求。
 
 use crate::edge_pin::{EdgePin, Pin};
+use crate::fetch_shape::FetchShape;
 use crate::stats::STATS;
 use crate::BoxStream;
 use bytes::Bytes;
@@ -85,6 +86,39 @@ pub struct DialedIo {
     pub h2: bool,
     /// 对端地址（经上游代理时不知道）
     pub peer: Option<SocketAddr>,
+    /// 按浏览器指纹握手的连接：h2 初始设置也照浏览器发（None 用池的默认设置）
+    pub h2_profile: Option<H2Profile>,
+}
+
+/// 浏览器的 HTTP/2 初始设置：SETTINGS 按发送顺序（id, 值），加连接级 WINDOW_UPDATE 的增量
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct H2Profile {
+    pub settings: Vec<(u16, u32)>,
+    pub connection_window_increment: Option<u32>,
+}
+
+impl H2Profile {
+    fn setting(&self, id: u16) -> Option<u32> {
+        self.settings
+            .iter()
+            .find(|(setting, _)| *setting == id)
+            .map(|(_, value)| *value)
+    }
+
+    /// 照浏览器的值配 hyper。h2 库按 id 升序发 SETTINGS，与 Chromium 的顺序一致；
+    /// 浏览器没发的项（如 MAX_FRAME_SIZE）就不发。ENABLE_PUSH=0 hyper 总会发
+    fn apply(&self, builder: &mut http2::Builder<TokioExecutor>) {
+        builder
+            .header_table_size(self.setting(1))
+            .initial_stream_window_size(self.setting(4))
+            .max_frame_size(self.setting(5));
+        if let Some(max) = self.setting(6) {
+            builder.max_header_list_size(max);
+        }
+        if let Some(increment) = self.connection_window_increment {
+            builder.initial_connection_window_size(increment.saturating_add(65_535));
+        }
+    }
 }
 
 pub type DialFuture<'a> =
@@ -93,7 +127,19 @@ pub type DialFuture<'a> =
 /// 池怎么建连、向谁问钉选状态。生产实现是 [`crate::ech::DohTlsConnector`]；测试连本地 h2c
 pub trait Dialer: Send + Sync + 'static {
     fn dial<'a>(&'a self, host: &'a str, port: u16) -> DialFuture<'a>;
+    /// 只谈 http/1.1 的连接（WebSocket 等协议升级用）
+    fn dial_h1<'a>(&'a self, host: &'a str, port: u16) -> DialFuture<'a>;
     fn edge(&self) -> Option<&EdgePin>;
+    /// 浏览器指纹模板的代数：模板变了（采到 WebView 的真实握手）旧指纹的连接不再复用
+    fn fingerprint_generation(&self) -> u64 {
+        0
+    }
+    /// 网关道请求按 WebView fetch 整形的依据（没有浏览器指纹时为 None）
+    fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        None
+    }
+    /// WebView 经 h2 MITM 发来的请求（采它的头顺序）
+    fn observe_webview_request(&self, _headers: &hyper::HeaderMap) {}
 }
 
 struct H2Conn {
@@ -103,6 +149,8 @@ struct H2Conn {
     in_flight: AtomicUsize,
     last_used: Mutex<Instant>,
     dead: AtomicBool,
+    /// 按浏览器指纹握手的连接：请求的 HEADERS 帧也照 Chromium 带优先级
+    chromium_priority: bool,
 }
 
 impl H2Conn {
@@ -209,15 +257,27 @@ impl UpstreamPool {
         })
     }
 
-    /// 当前代数：EdgePin 的（换网 / 亲和切换 / 赢家变化）加上池自己的
+    /// 当前代数：EdgePin 的（换网 / 亲和切换 / 赢家变化）、指纹模板的，加上池自己的
     fn epoch(&self) -> u64 {
-        self.dialer.edge().map(EdgePin::epoch).unwrap_or(0) + self.local_epoch.load(Ordering::Acquire)
+        self.dialer.edge().map(EdgePin::epoch).unwrap_or(0)
+            + self.dialer.fingerprint_generation()
+            + self.local_epoch.load(Ordering::Acquire)
     }
 
     /// 只算换网的代数（EdgePin 的换网 / 清缓存，加上池自己的）
     fn net_epoch(&self) -> u64 {
         self.dialer.edge().map(EdgePin::net_epoch).unwrap_or(0)
             + self.local_epoch.load(Ordering::Acquire)
+    }
+
+    /// 网关道请求的整形依据
+    pub fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        self.dialer.fetch_shape()
+    }
+
+    /// 交给建连方记下 WebView 的请求头顺序
+    pub fn observe_webview_request(&self, headers: &hyper::HeaderMap) {
+        self.dialer.observe_webview_request(headers);
     }
 
     /// 让现有连接全部不再复用（在途请求照常读完）
@@ -540,15 +600,27 @@ impl UpstreamPool {
     async fn dial(&self, key: &Key) -> Result<Lease, String> {
         let epoch_before = self.epoch();
         let net_before = self.net_epoch();
-        let DialedIo { io, h2, peer } = self
+        let DialedIo {
+            io,
+            h2,
+            peer,
+            h2_profile,
+        } = self
             .dialer
             .dial(&key.host, key.port)
             .await
             .map_err(|e| format!("Connect failed: {}", e))?;
         let io = TokioIo::new(io);
         if h2 {
-            let (sender, conn) = self
-                .h2_builder
+            let builder = match &h2_profile {
+                Some(profile) => {
+                    let mut builder = self.h2_builder.clone();
+                    profile.apply(&mut builder);
+                    builder
+                }
+                None => self.h2_builder.clone(),
+            };
+            let (sender, conn) = builder
                 .handshake::<_, PoolBody>(io)
                 .await
                 .map_err(|e| format!("H2 handshake failed: {}", e))?;
@@ -567,6 +639,7 @@ impl UpstreamPool {
                 in_flight: AtomicUsize::new(0),
                 last_used: Mutex::new(Instant::now()),
                 dead: AtomicBool::new(false),
+                chromium_priority: h2_profile.is_some(),
             });
             // 建连期间换过网（或连接对当前地址族不合格）就只给这一次用，不入池
             if !self.closed.load(Ordering::Acquire) && self.usable(&key.host, epoch, peer) {
@@ -658,6 +731,12 @@ impl UpstreamPool {
                 // 先拿到守卫：无论成功、失败还是被取消，在途计数都会扣回
                 let guard = StreamGuard::H2(conn.clone());
                 let mut sender = conn.sender.clone();
+                let mut req = into_h2_form(req);
+                if conn.chromium_priority {
+                    let weight = chromium_weight(&req);
+                    req.extensions_mut()
+                        .insert(h2::ext::RequestPriority { weight });
+                }
                 match sender.try_send_request(req).await {
                     Ok(response) => Ok(response.map(|body| PooledBody::wrap(body, guard))),
                     Err(mut error) => {
@@ -679,25 +758,77 @@ impl UpstreamPool {
                 mut sender,
                 epoch,
                 peer,
-            } => match sender.try_send_request(req).await {
-                Ok(response) => {
-                    // 响应体读完后连接回到空闲列表
-                    let guard = StreamGuard::H1 {
-                        pool: self.me.clone(),
-                        key: key.clone(),
-                        idle: Some((sender, epoch, peer)),
-                    };
-                    Ok(response.map(|body| PooledBody::wrap(body, guard)))
+            } => {
+                let absolute = req.uri().clone();
+                match sender.try_send_request(into_h1_form(req)).await {
+                    Ok(response) => {
+                        // 响应体读完后连接回到空闲列表
+                        let guard = StreamGuard::H1 {
+                            pool: self.me.clone(),
+                            key: key.clone(),
+                            idle: Some((sender, epoch, peer)),
+                        };
+                        Ok(response.map(|body| PooledBody::wrap(body, guard)))
+                    }
+                    Err(mut error) => {
+                        // 拿回的请求可能改发到 h2 连接上：恢复绝对 URI（:scheme / :authority 从它来）
+                        let unsent = error.take_message().map(|mut unsent| {
+                            *unsent.uri_mut() = absolute;
+                            unsent
+                        });
+                        Err(SendFailure {
+                            error: error.into_error(),
+                            unsent,
+                        })
+                    }
                 }
-                Err(mut error) => {
-                    let unsent = error.take_message();
-                    Err(SendFailure {
-                        error: error.into_error(),
-                        unsent,
-                    })
-                }
-            },
+            }
         }
+    }
+
+    /// WebSocket 等协议升级：单独建一条只谈 http/1.1 的上游连接（与 Chrome 给 WebSocket
+    /// 另开 h1 连接一致），转发升级请求；对端回 101 后把两侧升级出的连接对接起来。
+    /// 这种连接不入池
+    pub async fn forward_upgrade(
+        &self,
+        host: &str,
+        port: u16,
+        req: Request<PoolBody>,
+        client: hyper::upgrade::OnUpgrade,
+    ) -> Result<Response<PoolBody>, PoolError> {
+        let DialedIo { io, .. } = self
+            .dialer
+            .dial_h1(host, port)
+            .await
+            .map_err(|e| PoolError::Connect(format!("Connect failed: {}", e)))?;
+        let (mut sender, conn) = http1::handshake::<_, PoolBody>(TokioIo::new(io))
+            .await
+            .map_err(|e| PoolError::Connect(format!("H1 handshake failed: {}", e)))?;
+        let label = host.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                debug!("pool: upgrade connection to {} closed: {}", label, e);
+            }
+        });
+        let mut response = sender
+            .send_request(into_h1_form(req))
+            .await
+            .map_err(PoolError::Upstream)?;
+        if response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
+            let server = hyper::upgrade::on(&mut response);
+            let label = host.to_string();
+            tokio::spawn(async move {
+                match tokio::try_join!(client, server) {
+                    Ok((client, server)) => {
+                        let mut client = TokioIo::new(client);
+                        let mut server = TokioIo::new(server);
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                    Err(e) => debug!("pool: upgrade to {} failed: {}", label, e),
+                }
+            });
+        }
+        Ok(response.map(|body| body.boxed()))
     }
 
     // ---------- 回收 ----------
@@ -823,6 +954,69 @@ impl Replay {
         *req.headers_mut() = self.headers.clone();
         req
     }
+}
+
+/// 发往 h2 连接：去掉 Host 头（:authority 已由绝对 URI 给出）。浏览器在 h2 上不发 Host；
+/// 回环上的 Dart 请求与 WebView 的 h1 入站请求都带着它，原样转发会多出一个 `host` 头。
+/// 不用 `HeaderMap::remove`：它把最后一个头挪到被删的位置，头顺序就乱了
+fn into_h2_form(mut req: Request<PoolBody>) -> Request<PoolBody> {
+    if req.headers().contains_key(hyper::header::HOST) {
+        let headers = std::mem::take(req.headers_mut());
+        let kept = req.headers_mut();
+        kept.reserve(headers.len());
+        let mut current: Option<hyper::header::HeaderName> = None;
+        for (name, value) in headers {
+            if name.is_some() {
+                current = name;
+            }
+            match &current {
+                Some(name) if name != hyper::header::HOST => {
+                    kept.append(name.clone(), value);
+                }
+                _ => {}
+            }
+        }
+    }
+    req
+}
+
+/// Chromium 给请求的 HTTP/2 权重（由 Blink 资源优先级换算：HIGHEST 256、MEDIUM 220、
+/// LOWEST 147）。WebView 的请求按 `sec-fetch-dest` 推；Dart 的请求没有这个头，图片按
+/// LOWEST、其余按 fetch / XHR 的 MEDIUM 算
+fn chromium_weight<B>(req: &Request<B>) -> u16 {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    };
+    match header("sec-fetch-dest") {
+        "document" | "iframe" | "frame" | "style" | "font" => 256,
+        "image" => 147,
+        "" if header("accept").starts_with("image/") => 147,
+        _ => 220,
+    }
+}
+
+/// 发往 h1 连接：补上 Host（h2 入站请求只有 :authority），请求行改用 origin-form
+/// （浏览器直连源站时的写法）
+fn into_h1_form(mut req: Request<PoolBody>) -> Request<PoolBody> {
+    if let Some(authority) = req.uri().authority().cloned() {
+        if !req.headers().contains_key(hyper::header::HOST) {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(authority.as_str()) {
+                req.headers_mut().insert(hyper::header::HOST, value);
+            }
+        }
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        if let Ok(origin) = path.parse() {
+            *req.uri_mut() = origin;
+        }
+    }
+    req
 }
 
 /// 转发失败：建连（含 TLS / h2 握手）失败，或上游连接上出错
@@ -954,17 +1148,43 @@ impl Dialer for crate::ech::DohTlsConnector {
     fn dial<'a>(&'a self, host: &'a str, port: u16) -> DialFuture<'a> {
         Box::pin(async move {
             let (tls, peer) = self.connect_h2_with_peer(host, port).await?;
-            let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+            let h2 = tls.is_h2();
+            let h2_profile = tls.h2_profile();
             Ok(DialedIo {
                 io: Box::new(tls),
                 h2,
                 peer,
+                h2_profile,
+            })
+        })
+    }
+
+    fn dial_h1<'a>(&'a self, host: &'a str, port: u16) -> DialFuture<'a> {
+        Box::pin(async move {
+            let tls = self.connect(host, port).await?;
+            Ok(DialedIo {
+                io: Box::new(tls),
+                h2: false,
+                peer: None,
+                h2_profile: None,
             })
         })
     }
 
     fn edge(&self) -> Option<&EdgePin> {
         self.dns_resolver().map(|resolver| resolver.edge_pin().as_ref())
+    }
+
+    fn fingerprint_generation(&self) -> u64 {
+        crate::ech::DohTlsConnector::fingerprint_generation(self)
+    }
+
+    fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        crate::ech::DohTlsConnector::fetch_shape(self)
+    }
+
+    fn observe_webview_request(&self, headers: &hyper::HeaderMap) {
+        crate::ech::DohTlsConnector::observe_webview_request(self, headers)
     }
 }
 
@@ -1105,6 +1325,19 @@ mod tests {
                     io: Box::new(tcp),
                     h2: self.h2,
                     peer: Some(self.addr),
+                    h2_profile: None,
+                })
+            })
+        }
+
+        fn dial_h1<'a>(&'a self, _host: &'a str, _port: u16) -> DialFuture<'a> {
+            Box::pin(async move {
+                let tcp = TcpStream::connect(self.addr).await?;
+                Ok(DialedIo {
+                    io: Box::new(tcp),
+                    h2: false,
+                    peer: Some(self.addr),
+                    h2_profile: None,
                 })
             })
         }
@@ -1377,6 +1610,175 @@ mod tests {
         }
     }
 
+    /// 记下每个请求有没有 Host 头、请求目标长什么样的服务端
+    /// 记下每个请求的头名（按收到的顺序）与请求目标
+    type Seen = Arc<Mutex<Vec<(Vec<String>, String)>>>;
+
+    async fn spawn_recording_server(h2: bool) -> (SocketAddr, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Seen = Arc::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let record = record.clone();
+                let service = service_fn(move |req: Request<Incoming>| {
+                    record.lock().push((
+                        req.headers().keys().map(|name| name.to_string()).collect(),
+                        req.uri().to_string(),
+                    ));
+                    async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok")))) }
+                });
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let _ = if h2 {
+                        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(io, service)
+                            .await
+                    } else {
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await
+                    };
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    fn recording_dialer(addr: SocketAddr, h2: bool) -> TestDialer {
+        TestDialer {
+            addr,
+            h2,
+            dials: AtomicUsize::new(0),
+            edge: None,
+            panic_on: None,
+            succeed_first: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// h2 上游不带 Host 头（浏览器在 h2 上只发 :authority），其余头的顺序不变
+    #[tokio::test]
+    async fn h2_upstream_requests_carry_no_host_header() {
+        let (addr, seen) = spawn_recording_server(true).await;
+        let (pool, _dialer) = pool_with(recording_dialer(addr, true));
+        let mut req = request(hyper::Method::GET, "/ok", b"");
+        for name in ["user-agent", "accept", "sec-fetch-mode", "cookie"] {
+            req.headers_mut().append(name, "1".parse().unwrap());
+        }
+        let response = pool
+            .forward(Lane::Gateway, "example.test", 443, req, None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let seen = seen.lock().clone();
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec![(
+                names(&["user-agent", "accept", "sec-fetch-mode", "cookie"]),
+                "https://example.test/ok".to_string()
+            )]
+        );
+    }
+
+    /// h1 上游用 origin-form 请求行，没有 Host 时按 URI 补上（h2 入站请求只有 :authority）
+    #[tokio::test]
+    async fn h1_upstream_requests_use_origin_form_with_host() {
+        let (addr, seen) = spawn_recording_server(false).await;
+        let (pool, _dialer) = pool_with(recording_dialer(addr, false));
+        let mut req = request(hyper::Method::GET, "/ok?x=1", b"");
+        req.headers_mut().remove(hyper::header::HOST);
+        let response = pool
+            .forward(Lane::Mitm, "example.test", 443, req, None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let seen = seen.lock().clone();
+        assert_eq!(seen, vec![(vec!["host".to_string()], "/ok?x=1".to_string())]);
+    }
+
+    /// WebSocket 升级：另建 h1 上游连接转发升级请求，101 之后两侧字节对接
+    #[tokio::test]
+    async fn upgrade_requests_are_bridged_over_a_dedicated_h1_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let request_line: Arc<Mutex<String>> = Arc::default();
+        let line = request_line.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            *line.lock() = String::from_utf8_lossy(&head)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .await
+                .unwrap();
+            let mut data = [0u8; 4];
+            stream.read_exact(&mut data).await.unwrap();
+            stream.write_all(&data).await.unwrap();
+        });
+        let (pool, _dialer) = pool_with(recording_dialer(upstream_addr, false));
+
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound_addr = inbound.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = inbound.accept().await.unwrap();
+            let service = service_fn(move |mut req: Request<Incoming>| {
+                let pool = pool.clone();
+                async move {
+                    let client = hyper::upgrade::on(&mut req);
+                    *req.uri_mut() = format!("https://example.test{}", req.uri().path())
+                        .parse()
+                        .unwrap();
+                    let response = pool
+                        .forward_upgrade("example.test", 443, req.map(|body| body.boxed()), client)
+                        .await
+                        .unwrap();
+                    Ok::<_, Infallible>(response)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+
+        let exchange = async {
+            let mut client = TcpStream::connect(inbound_addr).await.unwrap();
+            client
+                .write_all(b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .await
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                client.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"));
+            client.write_all(b"ping").await.unwrap();
+            let mut echo = [0u8; 4];
+            client.read_exact(&mut echo).await.unwrap();
+            echo
+        };
+        let echo = tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("upgrade bridge should not hang");
+        assert_eq!(&echo, b"ping");
+        assert_eq!(*request_line.lock(), "GET /ws HTTP/1.1");
+    }
+
     /// 没有优选时的换网通知：首个签名只登记，签名真变了才作废
     #[tokio::test]
     async fn first_network_signature_only_registers() {
@@ -1400,8 +1802,15 @@ mod tests {
         assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
         assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 1);
         server.abort_conn_of_request(0);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        pool.reap();
+        // 连接任务发现对端关闭要被调度到；整套测试并行跑时可能晚一些
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            pool.reap();
+            if pool.h2_count(Lane::Gateway, "example.test", 443) == 0 || Instant::now() > deadline {
+                break;
+            }
+        }
         assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 0);
     }
 }

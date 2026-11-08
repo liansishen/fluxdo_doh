@@ -7,12 +7,13 @@
 use crate::cert::CertManager;
 use crate::dns::DnsResolver;
 use crate::ech::DohTlsConnector;
+use crate::edge_pin::is_cf_challenge_host;
 use crate::error::{DohProxyError, Result};
 use crate::stats::STATS;
 use crate::upstream_pool::{Lane, Replay, UpstreamPool};
 use crate::ProxyConfig;
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1 as hyper_http1;
 use hyper::service::service_fn;
@@ -114,13 +115,29 @@ impl DohProxyServer {
         };
 
         let dns_resolver_for_selector = dns_resolver.clone();
-        let doh_tls_connector = Arc::new(DohTlsConnector::new(
+        let doh_tls_connector = DohTlsConnector::new(
             dns_resolver,
             config.enable_doh,
             Duration::from_secs(config.timeout_secs),
             config.upstream_proxy.clone(),
             config.server_ip.clone(),
-        ));
+        );
+        // 浏览器指纹：网关道与 h2 MITM 道的上游握手照 WebView 的 ClientHello 复刻
+        #[cfg(feature = "browser-tls")]
+        let doh_tls_connector = if config.browser_tls && config.enable_doh {
+            info!("Browser TLS fingerprint enabled");
+            doh_tls_connector.with_browser_tls(Arc::new(crate::browser_tls::BrowserTls::new(
+                config
+                    .fingerprint_cache_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from),
+                config.webview_user_agent.clone(),
+            )))
+        } else {
+            doh_tls_connector
+        };
+        let doh_tls_connector = Arc::new(doh_tls_connector);
 
         // 本地动态优选：一等链路。先卸载上一轮的实例（重启网关时）
         crate::edge_pin::EdgePin::set_extra_covered_hosts(&config.extra_covered_hosts);
@@ -180,6 +197,17 @@ impl DohProxyServer {
     /// 上游连接池（FFI 换网通知时作废旧连接）
     pub fn pool(&self) -> &Arc<UpstreamPool> {
         &self.pool
+    }
+
+    /// 浏览器指纹出口的状态（模板来源、代数）；没开时 `enabled: false`
+    pub fn fingerprint_status(&self) -> serde_json::Value {
+        #[cfg(feature = "browser-tls")]
+        if let Some(browser) = self.doh_tls_connector.browser_tls() {
+            let mut status = browser.templates().status_json();
+            status["enabled"] = serde_json::Value::Bool(true);
+            return status;
+        }
+        serde_json::json!({ "enabled": false })
     }
 
     /// Get the local address the server is bound to
@@ -498,6 +526,7 @@ async fn handle_connect_mitm(
             .reunite(writer)
             .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
         let client_stream = PrefixedStream::new(client_stream, buffered);
+        let client_stream = sniff_client_hello(client_stream, &doh_tls_connector).await;
 
         let server_config = cert_manager.get_server_config(&host)?;
         let acceptor = TlsAcceptor::from(server_config);
@@ -509,6 +538,7 @@ async fn handle_connect_mitm(
             }
         };
         info!("Client TLS handshake complete for {} (h2 MITM)", host);
+        let client_tls = sniff_h2_preface(client_tls, &doh_tls_connector).await;
         return mitm_serve(client_tls, host, port, pool).await;
     }
 
@@ -537,6 +567,7 @@ async fn handle_connect_mitm(
         .reunite(writer)
         .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
     let client_stream = PrefixedStream::new(client_stream, buffered);
+    let client_stream = sniff_client_hello(client_stream, &doh_tls_connector).await;
 
     let server_config = cert_manager.get_server_config(&host)?;
     let acceptor = TlsAcceptor::from(server_config);
@@ -621,7 +652,7 @@ async fn handle_gateway_connection(
         .map_err(|e| DohProxyError::Proxy(format!("Gateway hyper error: {}", e)))
 }
 
-type GatewayBody = BoxBody<Bytes, hyper::Error>;
+type GatewayBody = crate::fetch_shape::ClientBody;
 type GatewayResponse = std::result::Result<Response<GatewayBody>, Infallible>;
 
 /// 网关自己生成的错误响应带上这个头：调用方据此区分「网关连不上上游」与
@@ -710,6 +741,18 @@ async fn gateway_forward_request(
         *req.uri_mut() = new_uri;
     }
 
+    // Dart 的请求照 WebView 的 fetch 请求整形；WebView 的请求反过来记下它的头顺序
+    let decode = match lane {
+        Lane::Gateway => pool
+            .fetch_shape()
+            .is_some_and(|shape| shape.apply(req.headers_mut())),
+        Lane::Mitm => {
+            if req.version() == hyper::Version::HTTP_2 {
+                pool.observe_webview_request(req.headers());
+            }
+            false
+        }
+    };
     let replay = Replay::capture(&req);
     match pool
         .forward(lane, &host, port, req.map(|body| body.boxed()), replay)
@@ -717,10 +760,61 @@ async fn gateway_forward_request(
     {
         Ok(resp) => {
             STATS.gw_ttfb.record(started.elapsed());
-            Ok(resp)
+            Ok(if decode {
+                crate::fetch_shape::decode_response(resp)
+            } else {
+                crate::fetch_shape::passthrough(resp)
+            })
         }
         Err(e) => {
             warn!("Gateway forward failed for {}: {}", host_key, e);
+            STATS.gw_502.inc();
+            Ok(gateway_error_response(502, &e.to_string()))
+        }
+    }
+}
+
+/// h1 的协议升级请求（WebSocket）：`Connection` 里有 upgrade 且带 `Upgrade` 头
+fn is_upgrade_request<B>(req: &Request<B>) -> bool {
+    req.version() <= hyper::Version::HTTP_11
+        && req.headers().contains_key(hyper::header::UPGRADE)
+        && req
+            .headers()
+            .get_all(hyper::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// 转发 WebSocket 等协议升级：另建一条 h1 上游连接，101 之后两侧原样对接
+async fn gateway_forward_upgrade(
+    mut req: Request<Incoming>,
+    pool: Arc<UpstreamPool>,
+    (host, port): (String, u16),
+) -> GatewayResponse {
+    let client = hyper::upgrade::on(&mut req);
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let authority = if port == 443 {
+        host.clone()
+    } else {
+        format!("{}:{}", host, port)
+    };
+    if let Ok(uri) = format!("https://{}{}", authority, path_and_query).parse() {
+        *req.uri_mut() = uri;
+    }
+    info!("MITM upgrade {} -> {}:{}", req.uri().path(), host, port);
+    match pool
+        .forward_upgrade(&host, port, req.map(|body| body.boxed()), client)
+        .await
+    {
+        Ok(response) => Ok(crate::fetch_shape::passthrough(response)),
+        Err(e) => {
+            warn!("MITM upgrade failed for {}:{}: {}", host, port, e);
             STATS.gw_502.inc();
             Ok(gateway_error_response(502, &e.to_string()))
         }
@@ -743,7 +837,12 @@ where
     let service = service_fn(move |req: Request<Incoming>| {
         let pool = pool.clone();
         let target = (host.clone(), port);
-        async move { gateway_forward_request(req, pool, Lane::Mitm, Some(target)).await }
+        async move {
+            if is_upgrade_request(&req) {
+                return gateway_forward_upgrade(req, pool, target).await;
+            }
+            gateway_forward_request(req, pool, Lane::Mitm, Some(target)).await
+        }
     });
 
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -770,30 +869,27 @@ async fn gateway_handle_connect_tunnel(
 
     info!("Gateway CONNECT (tunnel) {}:{}", host, port);
 
-    let connector_clone = connector.clone();
-    let host_clone = host.clone();
+    // 先连上游再回 200，连不上就给 CONNECT 回 502（与 MITM 的 CONNECT 一致）：以前先回 200
+    // 再连，失败只能掐断，浏览器记成 TLS 握手失败。验证页的 Turnstile 走这条路
+    let server_stream = match connector.connect_tcp(&host, port).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!("Gateway tunnel connect failed {}:{}: {}", host, port, e);
+            STATS.gw_502.inc();
+            return Ok(gateway_error_response(502, &e.to_string()));
+        }
+    };
 
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                // Connect to remote via DOH-resolved address
-                match connector_clone.connect_tcp(&host_clone, port).await {
-                    Ok(server_stream) => {
-                        let (mut cr, mut cw) = tokio::io::split(io);
-                        let (mut sr, mut sw) = tokio::io::split(server_stream);
-                        let _ = tokio::try_join!(
-                            tokio::io::copy(&mut cr, &mut sw),
-                            tokio::io::copy(&mut sr, &mut cw),
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Gateway tunnel connect failed {}:{}: {}",
-                            host_clone, port, e
-                        );
-                    }
-                }
+                let (mut cr, mut cw) = tokio::io::split(io);
+                let (mut sr, mut sw) = tokio::io::split(server_stream);
+                let _ = tokio::try_join!(
+                    tokio::io::copy(&mut cr, &mut sw),
+                    tokio::io::copy(&mut sr, &mut cw),
+                );
             }
             Err(e) => warn!("Gateway CONNECT tunnel upgrade failed: {}", e),
         }
@@ -868,6 +964,7 @@ async fn gateway_handle_connect(
                     upstream,
                     pool,
                     cert_manager,
+                    connector,
                 )
                 .await
                 {
@@ -889,6 +986,7 @@ async fn gateway_handle_connect(
 ///
 /// [upstream] 是回 200 之前已连好的上游（h1 MITM）；None 表示 h2 MITM，
 /// 上游按请求从池里取。
+#[allow(clippy::too_many_arguments)]
 async fn gateway_mitm_upgraded<I, S>(
     client_io: I,
     host: &str,
@@ -896,11 +994,13 @@ async fn gateway_mitm_upgraded<I, S>(
     upstream: Option<S>,
     pool: Arc<UpstreamPool>,
     cert_manager: Arc<CertManager>,
+    connector: Arc<DohTlsConnector>,
 ) -> Result<()>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let client_io = sniff_client_hello(client_io, &connector).await;
     // h2 MITM：accept client TLS（ALPN 含 h2）后交给 hyper 转发，上游按需连（带 ECH）
     let Some(server_tls) = upstream else {
         let server_config = cert_manager.get_server_config(host)?;
@@ -909,6 +1009,7 @@ where
             .accept(client_io)
             .await
             .map_err(DohProxyError::Io)?;
+        let client_tls = sniff_h2_preface(client_tls, &connector).await;
         return mitm_serve(client_tls, host.to_string(), port, pool).await;
     };
 
@@ -986,16 +1087,6 @@ fn in_mitm_scope(scope: &[String], host: &str) -> bool {
     })
 }
 
-fn is_cf_challenge_host(host: &str) -> bool {
-    const CF_CHALLENGE_DOMAIN: &str = "challenges.cloudflare.com";
-    let host = host.trim_end_matches('.');
-    if host.eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN) {
-        return true;
-    }
-    host.len() > CF_CHALLENGE_DOMAIN.len() + 1
-        && host.as_bytes()[host.len() - CF_CHALLENGE_DOMAIN.len() - 1] == b'.'
-        && host[host.len() - CF_CHALLENGE_DOMAIN.len()..].eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN)
-}
 
 /// Parse host:port from CONNECT target
 fn parse_host_port(target: &str) -> Result<(String, u16)> {
@@ -1019,6 +1110,53 @@ fn parse_host_port(target: &str) -> Result<(String, u16)> {
     } else {
         Ok((target.to_string(), 443))
     }
+}
+
+/// MITM 入站等 WebView 发来 ClientHello 的上限
+#[cfg(feature = "browser-tls")]
+const CLIENT_HELLO_PEEK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// MITM 入站：接受 TLS 之前窥探 WebView 的 ClientHello，记作浏览器指纹模板；读到的字节
+/// 原样放回流前面，再交给 rustls 接受
+async fn sniff_client_hello<S>(stream: S, connector: &DohTlsConnector) -> PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    #[cfg(feature = "browser-tls")]
+    if let Some(browser) = connector.browser_tls() {
+        let mut stream = stream;
+        let (consumed, hello) =
+            crate::browser_tls::peek_client_hello(&mut stream, CLIENT_HELLO_PEEK_TIMEOUT).await;
+        if let Some(hello) = hello {
+            browser.templates().record_hello(&hello);
+        }
+        return PrefixedStream::new(stream, consumed);
+    }
+    let _ = connector;
+    PrefixedStream::new(stream, Vec::new())
+}
+
+/// h2 MITM 入站：TLS 谈成 h2 时读出 WebView 的 h2 连接前言（初始 SETTINGS、连接窗口），
+/// 记进指纹模板；读到的字节放回流前面再交给 hyper。已经采到过就不再读
+async fn sniff_h2_preface<S>(
+    stream: tokio_rustls::server::TlsStream<S>,
+    connector: &DohTlsConnector,
+) -> PrefixedStream<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    #[cfg(feature = "browser-tls")]
+    if let Some(browser) = connector.browser_tls() {
+        let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        if h2 && !browser.templates().has_sampled_h2() {
+            let mut stream = stream;
+            let buffered =
+                crate::browser_tls::read_h2_preface(&mut stream, browser.templates()).await;
+            return PrefixedStream::new(stream, buffered);
+        }
+    }
+    let _ = connector;
+    PrefixedStream::new(stream, Vec::new())
 }
 
 struct PrefixedStream<S> {
@@ -1076,7 +1214,31 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_parse_host, in_mitm_scope, is_cf_challenge_host, is_loopback_host};
+    use super::{
+        gateway_parse_host, in_mitm_scope, is_cf_challenge_host, is_loopback_host,
+        is_upgrade_request,
+    };
+
+    /// WebSocket 握手才算升级请求；普通 keep-alive、h2 请求、只有 Upgrade 头的都不算
+    #[test]
+    fn upgrade_requests_are_recognised() {
+        let build = |version, connection: Option<&str>, upgrade: bool| {
+            let mut builder = hyper::Request::builder().version(version);
+            if let Some(connection) = connection {
+                builder = builder.header("connection", connection);
+            }
+            if upgrade {
+                builder = builder.header("upgrade", "websocket");
+            }
+            builder.body(()).unwrap()
+        };
+        use hyper::Version;
+        assert!(is_upgrade_request(&build(Version::HTTP_11, Some("Upgrade"), true)));
+        assert!(is_upgrade_request(&build(Version::HTTP_11, Some("keep-alive, upgrade"), true)));
+        assert!(!is_upgrade_request(&build(Version::HTTP_11, Some("keep-alive"), true)));
+        assert!(!is_upgrade_request(&build(Version::HTTP_11, Some("upgrade"), false)));
+        assert!(!is_upgrade_request(&build(Version::HTTP_2, Some("upgrade"), true)));
+    }
 
     /// MITM 范围为空 = 不限；有值时按后缀匹配，同名前缀的伪装域不算
     #[test]
