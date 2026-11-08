@@ -131,6 +131,10 @@ cargo build --release --target aarch64-apple-ios
 | `<port>` | 监听端口（0 = 自动分配） |
 | `--doh <url>` | DOH 服务器 URL |
 | `--ipv6` | 优先使用 IPv6 地址 |
+| `--ipv6-auto` | 自动探测本机 IPv6 可用性，决定连接地址族的优先级 |
+| `--browser-tls` | 启用浏览器 TLS / HTTP/2 指纹，需要构建时启用 `browser-tls` 特性 |
+| `--fingerprint-cache-path <path>` | 浏览器指纹缓存文件路径 |
+| `--webview-user-agent <ua>` | 用于匹配浏览器指纹的 WebView User-Agent |
 | `--ech-dns-policy <json>` | 公共入口策略，如 `{"enabled":true,"custom_domains":["example.com"]}` |
 
 ### 支持的 DOH 服务器

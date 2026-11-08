@@ -20,6 +20,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let prefer_ipv6 = args.iter().any(|a| a == "--ipv6");
+    let ipv6_auto = args.iter().any(|a| a == "--ipv6-auto");
+    let browser_tls = args.iter().any(|a| a == "--browser-tls");
+    let fingerprint_cache_path = args
+        .iter()
+        .position(|a| a == "--fingerprint-cache-path")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let webview_user_agent = args
+        .iter()
+        .position(|a| a == "--webview-user-agent")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let enable_doh = !args.iter().any(|a| a == "--no-doh");
     let gateway_mode = args.iter().any(|a| a == "--gateway");
     let h2_mitm = args.iter().any(|a| a == "--h2-mitm");
@@ -143,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enable_doh,
         gateway_mode,
         prefer_ipv6,
+        ipv6_auto,
         doh_server,
         doh_server_ech,
         ech_dns_policy: args
@@ -161,6 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         h2_mitm,
         mitm_connect,
         preconnect_hosts,
+        browser_tls,
+        fingerprint_cache_path,
+        webview_user_agent,
         doh_routes_url,
         select_mode,
         ..Default::default()
